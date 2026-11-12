@@ -97,6 +97,8 @@ public class MainActivity extends Activity {
     private final Handler ui = new Handler(Looper.getMainLooper());
     private boolean pollRunning = false;
     private int netFailCount = 0;
+    private boolean destroyed = false;
+    private int actSeq = 0;
 
     // ---- view state ----
     private JSONObject view;            // last player view from the server
@@ -115,6 +117,7 @@ public class MainActivity extends Activity {
     // local input locks (server confirms via poll a moment later)
     private String lockKey = "";        // gameId:round the player already acted in
     private String guessEntry = "";     // doan-so keypad entry
+    private String inputCtx = "";       // gameId:round the local input state belongs to
 
     // vibration bookkeeping
     private String lastVibKey = "";
@@ -155,11 +158,35 @@ public class MainActivity extends Activity {
         startTimerLoop();
     }
 
+    private void stopPolling() {
+        pollGen++;
+        pollRunning = false;
+    }
+
     @Override
     protected void onPause() {
         super.onPause();
         // Never leave a pad bit stuck "held" on the server.
         clearPad(true);
+        // Stop polling while backgrounded; onResume restarts it.
+        stopPolling();
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        if (inRoom && !destroyed) startPolling();
+    }
+
+    @Override
+    protected void onDestroy() {
+        destroyed = true;
+        inRoom = false;
+        stopPolling();
+        padExec.shutdownNow();
+        actExec.shutdownNow();
+        pollExec.shutdownNow();
+        super.onDestroy();
     }
 
     @Override
@@ -388,6 +415,7 @@ public class MainActivity extends Activity {
         view = null;
         currentSig = "";
         prevGameId = ""; prevMyLives = null; prevMyAlive = null; lastVibKey = "";
+        lockKey = ""; guessEntry = ""; inputCtx = "";
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         showRoomShell("Đang nối phòng " + sCode + "…");
         startPolling();
@@ -429,7 +457,7 @@ public class MainActivity extends Activity {
         final Resp fr = r; final Exception fe = err;
         ui.post(new Runnable() {
             @Override public void run() {
-                if (mySeq != joinSeq) return; // a newer attempt owns the screen
+                if (mySeq != joinSeq || destroyed) return; // a newer attempt owns the screen
                 if (fe != null) {
                     joining = false;
                     joinBtn.setEnabled(true);
@@ -502,16 +530,21 @@ public class MainActivity extends Activity {
     }
 
     private void handlePoll(Resp r, Exception err) {
-        if (err != null || r == null) {
+        JSONObject o = (err == null && r != null && r.status < 500) ? parseOk(r) : null;
+        if (o == null) {
+            // Network failure, an HTTP 5xx, or a non-JSON proxy error page:
+            // none of these prove the room is gone, so treat them as a
+            // connection hiccup and keep retrying instead of kicking the
+            // player out (leaveRoom also wipes their saved token/seat).
             netFailCount++;
             if (netFailCount == 3) toast("Đang mất kết nối, đang thử lại…");
             if (netFailCount >= 25) leaveRoom("Mất kết nối với phòng. Vào lại nhé.");
             return;
         }
-        JSONObject o = parseOk(r);
-        if (o == null || !o.optBoolean("ok", false)) {
-            // Room gone or session invalid: never sit on a stuck screen.
-            String error = o != null ? jStr(o, "error", "") : "";
+        if (!o.optBoolean("ok", false)) {
+            // Definitive server answer: room gone or session invalid —
+            // never sit on a stuck screen.
+            String error = jStr(o, "error", "");
             leaveRoom(error.length() > 0 ? error : "Phòng đã đóng hoặc hết hạn. Tạo phòng mới trên TV nhé.");
             return;
         }
@@ -527,6 +560,7 @@ public class MainActivity extends Activity {
             body.put("role", "player");
             body.put("token", sToken);
         } catch (Exception ignored) { }
+        final int seq = ++actSeq;
         actExec.execute(new Runnable() {
             @Override public void run() {
                 Resp r = null;
@@ -539,7 +573,9 @@ public class MainActivity extends Activity {
                     @Override public void run() {
                         if (!inRoom) return;
                         if (o.optBoolean("ok", false)) {
-                            if (useResponse) applyView(o);
+                            // Responses can land out of order on the thread
+                            // pool: only the latest action's view may win.
+                            if (useResponse && seq == actSeq) applyView(o);
                         } else {
                             String error = jStr(o, "error", "");
                             if (error.length() > 0 && !error.equals("Chưa vào game.")) toast(error);
@@ -622,7 +658,24 @@ public class MainActivity extends Activity {
     private long estServerNow() { return System.currentTimeMillis() + serverOffset; }
 
     private void applyView(JSONObject v) {
+        if (destroyed) return;
         view = v;
+        // Match boundary: a new match reuses the same gameId:round keys, so
+        // a local input lock (or a half-typed guess) from the PREVIOUS match
+        // must never survive into it — otherwise round 1 of every repeated
+        // game would start locked and its controls would ignore touches.
+        if (!jStr(v, "phase", "").equals("playing")) {
+            lockKey = "";
+            guessEntry = "";
+            inputCtx = "";
+        } else {
+            JSONObject gNow = jObj(v, "game");
+            String ctx = gNow == null ? "" : jStr(gNow, "id", "") + ":" + jInt(gNow, "round", 0);
+            if (!ctx.equals(inputCtx)) {
+                inputCtx = ctx;
+                guessEntry = ""; // digits typed for one round never carry into the next
+            }
+        }
         long sn = jLong(v, "serverNow", 0);
         if (sn > 0) serverOffset = sn - System.currentTimeMillis();
         JSONObject me = playerBySeat(v, sSeat);
@@ -638,6 +691,13 @@ public class MainActivity extends Activity {
         } else {
             updateDynamic(v);
         }
+    }
+
+    /** The worker's lastGame entry carries the game id under "game" (not "id"). */
+    private static String lastGameId(JSONObject lg) {
+        if (lg == null) return "";
+        String id = jStr(lg, "game", "");
+        return id.length() > 0 ? id : jStr(lg, "id", "");
     }
 
     private String pointsSig(JSONObject v, JSONObject points) {
@@ -670,7 +730,7 @@ public class MainActivity extends Activity {
         }
         if (phase.equals("results")) {
             JSONObject lg = jObj(v, "lastGame");
-            sb.append('|').append(lg == null ? "" : jStr(lg, "id", ""));
+            sb.append('|').append(lg == null ? "" : lastGameId(lg));
             sb.append('|').append(pointsSig(v, lg == null ? null : jObj(lg, "points")));
             return sb.toString();
         }
@@ -821,7 +881,7 @@ public class MainActivity extends Activity {
                     }
                 }
                 if (my > 0 && my >= max) {
-                    String key = "res:" + jStr(lg, "id", "") + ":" + pointsSig(v, pts);
+                    String key = "res:" + lastGameId(lg) + ":" + pointsSig(v, pts);
                     if (!key.equals(lastVibKey)) { lastVibKey = key; vibratePattern(new long[] { 0, 70, 50, 70 }); }
                 }
             }
@@ -833,6 +893,7 @@ public class MainActivity extends Activity {
     private void startTimerLoop() {
         ui.postDelayed(new Runnable() {
             @Override public void run() {
+                if (destroyed) return;
                 tickTimer();
                 startTimerLoop();
             }
