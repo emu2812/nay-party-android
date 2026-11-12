@@ -21,6 +21,20 @@ không qua webview, chạm là ăn ngay ở tầng hệ điều hành.
    - **Kéo Co** — nút KÉO khổng lồ (mỗi lần bấm là một nhịp kéo), thanh nút thắt trực tiếp.
    - **Chia Hay Cướp** — ô nhập lời thương lượng + nút Gửi trong lúc đàm phán,
      nút CHIA / CƯỚP bí mật ở pha chọn.
+   - **Cướp Sao** — gamepad (A: XÔ, B: Lướt), hiện tổng sao đã nhặt của mình.
+   - **Giữ Vương Miện** — gamepad (A: XÔ, B: Lướt), banner "BẠN ĐANG GIỮ
+     VƯƠNG MIỆN 👑" + điểm giữ của mình khi đang đội vương miện.
+   - **Sơn Sàn** — gamepad (A: SƠN BÙNG, B: Lướt), hiện số ô đã sơn của mình.
+   - **Cao Bồi** — nút khổng lồ ĐỢI… / BẮN!, kẹt súng khi bắn sớm, hiện thời
+     gian phản ứng + điểm ở cuối mỗi vòng.
+   - **Chung Một Thân** (hợp tác) — gamepad mà chỉ các hướng được chia cho
+     mình mới sáng (hướng của đồng đội bị làm mờ), hiện điểm kiểm tra + tim đội.
+   - **Đẩy Hộp Về Đích** (hợp tác) — gamepad thường, hiện số hộp đội đã giao.
+   - **Chèo Thuyền** (hợp tác) — nút CHÈO khổng lồ tự cháy VÀNG đúng cửa sổ
+     nhịp (±260ms, tính theo giờ máy chủ đã đồng bộ), hiện số lần trúng
+     nhịp / tạt nước của mình.
+   - Game hợp tác: màn kết quả và bục vinh quang hiện **banner thành tích
+     đội** (hạng + điểm mỗi người + thành tích đội) giống bản web.
 4. App rung khi trả lời đúng, thắng vòng, mất mạng/bị loại (giống bản web),
    giữ màn hình luôn sáng khi đang trong phòng, và tự nhớ mã phòng + tên.
 

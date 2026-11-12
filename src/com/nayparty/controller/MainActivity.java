@@ -110,6 +110,15 @@ public class MainActivity extends Activity {
     private TextView tvTimer;           // countdown / phase timer text
     private TextView tvMyCount;         // dua-bam my tap count
     private TextView tvLives;           // arena lives
+    private TextView tvMineValue;       // cuop-sao banked / crown hold / splat cells / box deliveries / shared checks
+    private TextView tvHearts;          // chung-mot-than team hearts
+    private TextView tvCrownLine;       // giu-vuong-mien holder banner (updated in place, no rebuild)
+    // cheo-thuyen fast-ticker refs (beat flash runs off server-synced time)
+    private Button rowBtn;
+    private GradientDrawable rowBgNorm, rowBgGold;
+    private FrameLayout rowTrack;
+    private View rowFill;
+    private TextView tvRowMeta, tvRowHits, tvRowSplash;
     private View knotMarker;            // keo-co knot marker
     private View knotTrack;
     private int duaDisplay = -1;        // optimistic dua-bam display count
@@ -156,6 +165,7 @@ public class MainActivity extends Activity {
             showJoin(null);
         }
         startTimerLoop();
+        startRowLoop();
     }
 
     private void stopPolling() {
@@ -312,6 +322,13 @@ public class MainActivity extends Activity {
         if (o == null) return def;
         Object v = o.opt(k);
         if (v instanceof Number) return ((Number) v).longValue();
+        return def;
+    }
+
+    private static double jDouble(JSONObject o, String k, double def) {
+        if (o == null) return def;
+        Object v = o.opt(k);
+        if (v instanceof Number) return ((Number) v).doubleValue();
         return def;
     }
 
@@ -780,6 +797,21 @@ public class MainActivity extends Activity {
                         if (c != null) sb.append('|').append(jInt(c, "seat", 0)).append(':').append(jStr(c, "text", ""));
                     }
                 }
+            } else if (gid.equals("cuop-sao") || gid.equals("giu-vuong-mien") || gid.equals("son-san")) {
+                // Steady pad screen: banked/hold/cells and the crown banner
+                // all refresh in place via updateDynamic — no rebuilds.
+            } else if (gid.equals("cao-boi")) {
+                sb.append(':').append(jStr(g, "mine", "waiting"));
+            } else if (gid.equals("chung-mot-than")) {
+                // Owned directions are dealt once per match; the pad screen
+                // only depends on them (hearts/checks update in place).
+                JSONArray md = jArr(g, "myDirs");
+                if (md != null) {
+                    for (int i = 0; i < md.length(); i++) sb.append(':').append(md.optString(i, ""));
+                }
+            } else if (gid.equals("day-hop") || gid.equals("cheo-thuyen")) {
+                // Steady screens: deliveries / beat stats update in place
+                // (cheo-thuyen also has its own 50ms beat ticker).
             }
             return sb.toString();
         }
@@ -822,6 +854,38 @@ public class MainActivity extends Activity {
                 knotMarker.setLayoutParams(p);
             }
         }
+        if ((gid.equals("cuop-sao") || gid.equals("giu-vuong-mien") || gid.equals("son-san"))
+                && tvMineValue != null) {
+            tvMineValue.setText(String.valueOf(jInt(g, "mine", 0)));
+        }
+        if (gid.equals("giu-vuong-mien") && tvCrownLine != null) {
+            tvCrownLine.setText(crownBanner(v, g));
+            tvCrownLine.setTextColor(jBool(g, "myCrown", false)
+                ? Color.parseColor("#FFC93D") : C_TEXT);
+        }
+        if (gid.equals("day-hop") && tvMineValue != null) {
+            tvMineValue.setText(String.valueOf(jInt(g, "deliveries", 0)));
+        }
+        if (gid.equals("chung-mot-than")) {
+            if (tvMineValue != null) tvMineValue.setText(String.valueOf(jInt(g, "checks", 0)));
+            if (tvHearts != null) tvHearts.setText(hearts(jInt(g, "hearts", 0)));
+        }
+        if (gid.equals("cheo-thuyen")) {
+            if (tvRowHits != null) tvRowHits.setText(String.valueOf(jInt(g, "mine", 0)));
+            if (tvRowSplash != null) tvRowSplash.setText(String.valueOf(jInt(g, "mySplash", 0)));
+        }
+    }
+
+    /** Crown banner text for Giữ Vương Miện, mirroring the web phone line. */
+    private String crownBanner(JSONObject v, JSONObject g) {
+        if (jBool(g, "myCrown", false)) return "👑 BẠN ĐANG GIỮ VƯƠNG MIỆN!";
+        JSONObject crown = jObj(g, "crown");
+        Object holder = crown == null ? null : crown.opt("holder");
+        if (holder instanceof Number) {
+            JSONObject hp = playerBySeat(v, ((Number) holder).intValue());
+            if (hp != null) return "Vương miện: " + jStr(hp, "name", "") + " đang giữ";
+        }
+        return "Vương miện đang ở giữa sàn!";
     }
 
     private String hearts(int n) {
@@ -913,6 +977,57 @@ public class MainActivity extends Activity {
         } else {
             tvTimer.setText(rem > 0 ? ("Còn " + (long) Math.ceil(rem / 1000.0) + "s") : "");
         }
+    }
+
+    // ======================= cheo-thuyen beat ticker =======================
+    // Mirrors the web client's rowbtn flash: the CHÈO button burns gold
+    // inside the +-260ms stroke window around each 1000ms beat, computed
+    // client-side from server-synced time (serverOffset) so it stays
+    // smooth between the 300ms polls.
+
+    private void startRowLoop() {
+        ui.postDelayed(new Runnable() {
+            @Override public void run() {
+                if (destroyed) return;
+                tickRow();
+                startRowLoop();
+            }
+        }, 50);
+    }
+
+    private void tickRow() {
+        if (rowBtn == null || view == null) return;
+        if (!rowBtn.isAttachedToWindow()) return;
+        JSONObject g = jObj(view, "game");
+        if (g == null || !jStr(g, "id", "").equals("cheo-thuyen")
+            || !jStr(g, "phase", "").equals("row")) return;
+        long nb = jLong(g, "nextBeatAt", 0);
+        long rs = jLong(g, "rowStart", 0);
+        if (nb > 0 && rs > 0) {
+            long t = estServerNow();
+            boolean inWin = (nb - t >= 0 && nb - t <= 260)
+                || (t - (nb - 1000) <= 260 && nb - 1000 >= rs);
+            rowBtn.setBackground(inWin ? rowBgGold : rowBgNorm);
+        }
+        double dist = jDouble(g, "distance", 0);
+        int course = jInt(g, "course", 400);
+        if (tvRowMeta != null) {
+            tvRowMeta.setText("Nhịp " + jInt(g, "beat", 1) + "/" + jInt(g, "beats", 45)
+                + " · Thuyền đã đi " + Math.round(dist) + "/" + course + " m");
+        }
+        if (rowTrack != null && rowFill != null) {
+            int tw = rowTrack.getWidth();
+            if (tw > 0 && course > 0) {
+                double pct = dist / course;
+                if (pct < 0) pct = 0;
+                if (pct > 1) pct = 1;
+                FrameLayout.LayoutParams fp = (FrameLayout.LayoutParams) rowFill.getLayoutParams();
+                int w = (int) (tw * pct);
+                if (fp.width != w) { fp.width = w; rowFill.setLayoutParams(fp); }
+            }
+        }
+        if (tvRowHits != null) tvRowHits.setText(String.valueOf(jInt(g, "mine", 0)));
+        if (tvRowSplash != null) tvRowSplash.setText(String.valueOf(jInt(g, "mySplash", 0)));
     }
 
     // ======================= join screen =======================
@@ -1078,7 +1193,7 @@ public class MainActivity extends Activity {
             String gid = jStr(g, "id", "");
             if (jBool(g, "finalRound", false)
                 && (gid.equals("nhanh-tay") || gid.equals("do-vui") || gid.equals("doan-so")
-                    || gid.equals("dua-bam") || gid.equals("nho-mau"))) {
+                    || gid.equals("dua-bam") || gid.equals("nho-mau") || gid.equals("cao-boi"))) {
                 sub += " · Vòng cuối ×2";
             }
         } else {
@@ -1153,12 +1268,31 @@ public class MainActivity extends Activity {
         return panel(sv, C_PANEL, C_BG);
     }
 
+    /** Co-op team banner (lastGame.teamResult), mirroring the web results screen. */
+    private View teamBanner(JSONObject lg) {
+        JSONObject tr = lg == null ? null : jObj(lg, "teamResult");
+        if (tr == null) return null;
+        LinearLayout b = col();
+        b.setBackground(roundRect(Color.parseColor("#3A2A05"), Color.parseColor("#FFC93D"), 16));
+        b.setPadding(dp(14), dp(10), dp(14), dp(10));
+        TextView l1 = centerText("🏆 Cả đội đạt hạng " + jStr(tr, "tierLabel", "")
+            + " — mỗi người +" + fmt(jInt(tr, "pointsEach", 0)) + " điểm!", 18,
+            Color.parseColor("#FFC93D"), true);
+        b.addView(l1);
+        TextView l2 = centerText("Thành tích đội: " + fmt(jInt(tr, "score", 0))
+            + " " + jStr(tr, "unit", ""), 15, C_TEXT, false);
+        b.addView(l2, matchWrap(2));
+        return b;
+    }
+
     private View resultsView(JSONObject v) {
         JSONObject lg = jObj(v, "lastGame");
         JSONObject pts = lg == null ? null : jObj(lg, "points");
         LinearLayout c = col();
         c.addView(centerText("Kết quả game", 22, C_TEXT, true));
         if (lg != null) c.addView(centerText(jStr(lg, "name", ""), 17, accent(), true), matchWrap(2));
+        View banner = teamBanner(lg);
+        if (banner != null) c.addView(banner, matchWrap(10));
         int my = pts == null ? 0 : pts.optInt(String.valueOf(sSeat), 0);
         TextView big = centerText("+" + fmt(my) + " điểm", 40, C_GREEN, true);
         c.addView(big, matchWrap(10));
@@ -1179,6 +1313,12 @@ public class MainActivity extends Activity {
     private View standingsView(JSONObject v, String title, String footer) {
         LinearLayout c = col();
         c.addView(centerText(title, 24, C_TEXT, true));
+        if (jStr(v, "phase", "").equals("podium")) {
+            // Co-op: the podium is a TEAM result (everyone banked the same
+            // points) — show the team banner like the results screen does.
+            View banner = teamBanner(jObj(v, "lastGame"));
+            if (banner != null) c.addView(banner, matchWrap(8));
+        }
         JSONArray st = jArr(v, "standings");
         int myRank = 0;
         if (st != null) {
@@ -1254,6 +1394,13 @@ public class MainActivity extends Activity {
         if (gid.equals("ne-dan")) return new int[] { 0xFF33104F, 0xFF0C0618 };
         if (gid.equals("keo-co")) return new int[] { 0xFF0A4034, 0xFF04140F };
         if (gid.equals("chia-cuop")) return new int[] { 0xFF2B1E63, 0xFF0D0A22 };
+        if (gid.equals("cuop-sao")) return new int[] { 0xFF2E2005, 0xFF140E02 };
+        if (gid.equals("giu-vuong-mien")) return new int[] { 0xFF2A1052, 0xFF0E0618 };
+        if (gid.equals("son-san")) return new int[] { 0xFF04303A, 0xFF02141A };
+        if (gid.equals("cao-boi")) return new int[] { 0xFF3A1C05, 0xFF180B02 };
+        if (gid.equals("chung-mot-than")) return new int[] { 0xFF2A1458, 0xFF0C0518 };
+        if (gid.equals("day-hop")) return new int[] { 0xFF331D04, 0xFF120A01 };
+        if (gid.equals("cheo-thuyen")) return new int[] { 0xFF083A56, 0xFF02101A };
         return new int[] { C_PANEL, C_BG };
     }
 
@@ -1281,6 +1428,10 @@ public class MainActivity extends Activity {
     }
 
     private View gameScreen(JSONObject v, JSONObject g) {
+        // Any rebuild detaches the cheo-thuyen ticker's views; clear the
+        // refs so the ticker idles until rowBoat() installs fresh ones.
+        rowBtn = null; rowTrack = null; rowFill = null;
+        tvRowMeta = null; tvRowHits = null; tvRowSplash = null;
         String gid = jStr(g, "id", "");
         String gp = jStr(g, "phase", "");
         int[] sc = stageColors(gid);
@@ -1304,6 +1455,11 @@ public class MainActivity extends Activity {
         else if (gid.equals("day-ra") || gid.equals("ne-dan")) inner = arenaPad(v, g);
         else if (gid.equals("keo-co")) inner = keoCo(v, g);
         else if (gid.equals("chia-cuop")) inner = chiaCuop(v, g);
+        else if (gid.equals("cuop-sao") || gid.equals("giu-vuong-mien") || gid.equals("son-san")) inner = versusPad(v, g);
+        else if (gid.equals("cao-boi")) inner = caoBoi(v, g);
+        else if (gid.equals("chung-mot-than")) inner = sharedBody(v, g);
+        else if (gid.equals("day-hop")) inner = boxPush(v, g);
+        else if (gid.equals("cheo-thuyen")) inner = rowBoat(v, g);
         else {
             inner = col();
             inner.addView(centerText("Đang chơi: " + jStr(g, "name", ""), 18, C_TEXT, true));
@@ -1665,12 +1821,16 @@ public class MainActivity extends Activity {
         private final GradientDrawable bgOn;
 
         PadButton(int bit, String label, int base, int glow, float radiusDp) {
+            this(bit, label, base, glow, radiusDp, 17);
+        }
+
+        PadButton(int bit, String label, int base, int glow, float radiusDp, float textSp) {
             super(MainActivity.this);
             this.bit = bit;
             setText(label);
             setTextColor(Color.WHITE);
             setTypeface(Typeface.DEFAULT_BOLD);
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 17);
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, textSp);
             setAllCaps(false);
             setFocusable(false);
             bgOff = roundRect(base, glow, radiusDp);
@@ -1810,6 +1970,364 @@ public class MainActivity extends Activity {
         c.addView(centerText(gid.equals("ne-dan")
             ? "Giữ D-pad để né đạn · B: lướt nhanh"
             : "Giữ D-pad để di chuyển · A: đẩy đối thủ · B: lướt nhanh", 14, C_MUTED, false), matchWrap(12));
+        return c;
+    }
+
+    /**
+     * Shared D-pad + A/B cluster for the newer games (same geometry as the
+     * day-ra/ne-dan pad). dimDirs holds direction keys ("u","d","l","r")
+     * to render dimmed — used by Chung Một Thân, where only the directions
+     * a player owns are live (the server filters the rest anyway).
+     */
+    private LinearLayout padCluster(String aLabel, String bLabel, float abSp, HashSet<String> dimDirs) {
+        LinearLayout padRow = new LinearLayout(this);
+        padRow.setOrientation(LinearLayout.HORIZONTAL);
+        padRow.setGravity(Gravity.CENTER);
+
+        LinearLayout dpad = col();
+        int DB = dp(62);
+        int[][] bits = {
+            { -1, B_U, -1 },
+            { B_L, -1, B_R },
+            { -1, B_D, -1 } };
+        String[][] keys = {
+            { "", "u", "" },
+            { "l", "", "r" },
+            { "", "d", "" } };
+        String[][] labels = {
+            { "", "▲", "" },
+            { "◀", "", "▶" },
+            { "", "▼", "" } };
+        for (int r = 0; r < 3; r++) {
+            LinearLayout rowL = new LinearLayout(this);
+            rowL.setOrientation(LinearLayout.HORIZONTAL);
+            for (int k = 0; k < 3; k++) {
+                if (bits[r][k] < 0) {
+                    View empty = new View(this);
+                    rowL.addView(empty, new LinearLayout.LayoutParams(DB, DB));
+                } else {
+                    PadButton b = new PadButton(bits[r][k], labels[r][k],
+                        C_PANEL2, Color.parseColor("#6DB6F2"), 16);
+                    if (dimDirs != null && dimDirs.contains(keys[r][k])) b.setAlpha(0.35f);
+                    LinearLayout.LayoutParams bp = new LinearLayout.LayoutParams(DB, DB);
+                    if (k > 0) bp.leftMargin = dp(4);
+                    rowL.addView(b, bp);
+                }
+            }
+            LinearLayout.LayoutParams rp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            if (r > 0) rp.topMargin = dp(4);
+            dpad.addView(rowL, rp);
+        }
+        padRow.addView(dpad);
+
+        View gap = new View(this);
+        padRow.addView(gap, new LinearLayout.LayoutParams(dp(26), 1));
+
+        LinearLayout ab = col();
+        LinearLayout rowA = new LinearLayout(this);
+        rowA.setOrientation(LinearLayout.HORIZONTAL);
+        View spA = new View(this);
+        rowA.addView(spA, new LinearLayout.LayoutParams(dp(38), 1));
+        PadButton btnA = new PadButton(B_A, aLabel, Color.parseColor("#B03030"),
+            Color.parseColor("#FF6B6B"), 999, abSp);
+        rowA.addView(btnA, new LinearLayout.LayoutParams(dp(84), dp(84)));
+        ab.addView(rowA);
+        LinearLayout rowB = new LinearLayout(this);
+        rowB.setOrientation(LinearLayout.HORIZONTAL);
+        PadButton btnB = new PadButton(B_B, bLabel, Color.parseColor("#2F7FBF"),
+            Color.parseColor("#6DB6F2"), 999, abSp);
+        rowB.addView(btnB, new LinearLayout.LayoutParams(dp(84), dp(84)));
+        LinearLayout.LayoutParams rb = new LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        rb.topMargin = dp(6);
+        ab.addView(rowB, rb);
+        padRow.addView(ab);
+        return padRow;
+    }
+
+    // ---------- Cướp Sao / Giữ Vương Miện / Sơn Sàn (versus arena pads) ----------
+    private LinearLayout versusPad(JSONObject v, JSONObject g) {
+        clearPad(true); // a rebuilt screen must never inherit a stuck "held" bit
+        LinearLayout c = col();
+        c.setGravity(Gravity.CENTER_HORIZONTAL);
+        String gid = jStr(g, "id", "");
+        String gp = jStr(g, "phase", "");
+        boolean live = (gid.equals("cuop-sao") && gp.equals("steal"))
+            || (gid.equals("giu-vuong-mien") && gp.equals("crown"))
+            || (gid.equals("son-san") && gp.equals("splat"));
+        if (!live) {
+            c.addView(centerText("Đợi vào sân…", 18, C_MUTED, false), matchWrap(30));
+            return c;
+        }
+        String aLabel = "A\nXÔ";
+        float abSp = 17;
+        String hint;
+        if (gid.equals("cuop-sao")) {
+            LinearLayout row = new LinearLayout(this);
+            row.setOrientation(LinearLayout.HORIZONTAL);
+            row.setGravity(Gravity.CENTER);
+            row.addView(text("Sao của bạn: ★ ", 20, C_TEXT, true));
+            TextView mv = text(String.valueOf(jInt(g, "mine", 0)), 22, Color.parseColor("#FFC93D"), true);
+            tvMineValue = mv;
+            row.addView(mv);
+            c.addView(row, matchWrap(6));
+            hint = "Bay qua sao là nhặt · A: xô mạnh, đối thủ rơi 1 sao · Sao lớn = 3 sao";
+        } else if (gid.equals("giu-vuong-mien")) {
+            TextView banner = centerText(crownBanner(v, g), 21,
+                jBool(g, "myCrown", false) ? Color.parseColor("#FFC93D") : C_TEXT, true);
+            tvCrownLine = banner;
+            c.addView(banner, matchWrap(6));
+            LinearLayout row = new LinearLayout(this);
+            row.setOrientation(LinearLayout.HORIZONTAL);
+            row.setGravity(Gravity.CENTER);
+            row.addView(text("Điểm giữ của bạn: ", 17, C_TEXT, true));
+            TextView mv = text(String.valueOf(jInt(g, "mine", 0)), 19, accent(), true);
+            tvMineValue = mv;
+            row.addView(mv);
+            c.addView(row, matchWrap(2));
+            hint = "Chạm vào vương miện là đội lên đầu · Giữ càng lâu càng nhiều điểm · A: xô người giữ cho rơi";
+        } else { // son-san
+            JSONArray grid = jArr(g, "grid");
+            int total = grid != null ? grid.length() : 144;
+            LinearLayout row = new LinearLayout(this);
+            row.setOrientation(LinearLayout.HORIZONTAL);
+            row.setGravity(Gravity.CENTER);
+            row.addView(text("Ô của bạn: ", 20, C_TEXT, true));
+            TextView mv = text(String.valueOf(jInt(g, "mine", 0)), 22, accent(), true);
+            tvMineValue = mv;
+            row.addView(mv);
+            row.addView(text("/" + total, 20, C_TEXT, true));
+            c.addView(row, matchWrap(6));
+            aLabel = "A\nSƠN BÙNG";
+            abSp = 13;
+            hint = "Chạy qua ô nào sơn ô đó · A: sơn bùng 3×3 (hồi 2 giây) · B: lướt nhanh";
+        }
+        LinearLayout.LayoutParams pr = matchWrap(16);
+        pr.gravity = Gravity.CENTER_HORIZONTAL;
+        c.addView(padCluster(aLabel, "B\nLướt", abSp, null), pr);
+        c.addView(centerText(hint, 14, C_MUTED, false), matchWrap(12));
+        return c;
+    }
+
+    // ---------- Cao Bồi (duel: one huge button) ----------
+    private LinearLayout caoBoi(JSONObject v, JSONObject g) {
+        LinearLayout c = col();
+        c.setGravity(Gravity.CENTER_HORIZONTAL);
+        String gp = jStr(g, "phase", "");
+        String mine = jStr(g, "mine", "waiting");
+        final String lock = "cao-boi:" + jInt(g, "round", 0);
+        if (gp.equals("wait")) {
+            if (mine.equals("foul")) {
+                c.addView(centerText("KẸT SÚNG!", 32, C_RED, true), matchWrap(30));
+                c.addView(centerText("Bạn bắn trước hiệu lệnh — bị khoá và −100 điểm vòng này. Đợi vòng sau nhé.", 16, C_TEXT, false), matchWrap(6));
+            } else {
+                Button b = bigButton("ĐỢI…\nNghe hiệu lệnh BẮN!", C_RED, 0xFFFF8A8A, 28);
+                LinearLayout.LayoutParams p = lp(dp(270), dp(270), 26);
+                p.gravity = Gravity.CENTER_HORIZONTAL;
+                c.addView(b, p);
+                fireOnDown(b, new Runnable() {
+                    @Override public void run() {
+                        if (lockKey.equals(lock)) return;
+                        lockKey = lock;
+                        sendAction(actionBody("tap"), true);
+                    }
+                });
+            }
+        } else if (gp.equals("go")) {
+            if (mine.equals("fired")) {
+                c.addView(centerText("ĐÃ BẮN! Đợi kết quả…", 28, C_TEXT, true), matchWrap(40));
+            } else {
+                Button b = bigButton("BẮN!", Color.parseColor("#1FA855"), C_GREEN, 36);
+                LinearLayout.LayoutParams p = lp(dp(270), dp(270), 26);
+                p.gravity = Gravity.CENTER_HORIZONTAL;
+                c.addView(b, p);
+                fireOnDown(b, new Runnable() {
+                    @Override public void run() {
+                        if (lockKey.equals(lock)) return;
+                        lockKey = lock;
+                        sendAction(actionBody("tap"), true);
+                    }
+                });
+            }
+        } else if (gp.equals("roundEnd")) {
+            JSONObject lr = jObj(g, "lastRound");
+            JSONArray es = lr == null ? null : jArr(lr, "entries");
+            JSONObject e = null;
+            if (es != null) {
+                for (int i = 0; i < es.length(); i++) {
+                    JSONObject x = es.optJSONObject(i);
+                    if (x != null && jInt(x, "seat", -1) == sSeat) { e = x; break; }
+                }
+            }
+            if (e != null) {
+                String st = jStr(e, "status", "");
+                String msg;
+                if (st.equals("fired")) {
+                    msg = "Bạn bắn trong " + jInt(e, "reactionMs", 0) + " ms — nhanh thứ " + jInt(e, "order", 0) + "!";
+                } else if (st.equals("foul")) msg = "Phạm quy! Bắn quá sớm";
+                else msg = "Bạn chưa bắn";
+                c.addView(centerText(msg, 25, C_TEXT, true), matchWrap(34));
+                int pts = jInt(e, "points", 0);
+                c.addView(centerText((pts > 0 ? "+" : "") + fmt(pts) + " điểm", 24, pts > 0 ? C_GREEN : C_MUTED, true), matchWrap(8));
+            } else {
+                c.addView(centerText("Hết vòng!", 24, C_TEXT, true), matchWrap(34));
+            }
+        } else {
+            c.addView(centerText("Đợi…", 20, C_MUTED, false), matchWrap(40));
+        }
+        return c;
+    }
+
+    // ---------- Chung Một Thân (co-op: split steering of one shared ball) ----------
+    private LinearLayout sharedBody(JSONObject v, JSONObject g) {
+        clearPad(true);
+        LinearLayout c = col();
+        c.setGravity(Gravity.CENTER_HORIZONTAL);
+        if (!jStr(g, "phase", "").equals("shared")) {
+            c.addView(centerText("Đợi…", 18, C_MUTED, false), matchWrap(30));
+            return c;
+        }
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER);
+        row.addView(text("⭐ Đội: ", 19, C_TEXT, true));
+        TextView chk = text(String.valueOf(jInt(g, "checks", 0)), 20, accent(), true);
+        tvMineValue = chk;
+        row.addView(chk);
+        row.addView(text(" điểm · Tim: ", 19, C_TEXT, true));
+        TextView hr = text(hearts(jInt(g, "hearts", 0)), 19, Color.parseColor("#FF8FA3"), true);
+        tvHearts = hr;
+        row.addView(hr);
+        c.addView(row, matchWrap(6));
+
+        // Which directions are MINE (dealt by the server in game.myDirs)
+        JSONArray md = jArr(g, "myDirs");
+        HashSet<String> mine = new HashSet<String>();
+        if (md != null) for (int i = 0; i < md.length(); i++) mine.add(md.optString(i, ""));
+        LinearLayout dirs = new LinearLayout(this);
+        dirs.setOrientation(LinearLayout.HORIZONTAL);
+        dirs.setGravity(Gravity.CENTER);
+        dirs.addView(text("Bạn giữ: ", 16, C_MUTED, true));
+        if (mine.isEmpty()) {
+            dirs.addView(text("—", 16, C_TEXT, true));
+        } else {
+            String[][] arrows = { { "u", "▲" }, { "r", "▶" }, { "d", "▼" }, { "l", "◀" } };
+            for (int i = 0; i < arrows.length; i++) {
+                if (!mine.contains(arrows[i][0])) continue;
+                TextView chip = centerText(arrows[i][1], 20, Color.WHITE, true);
+                chip.setBackground(roundRect(accent(), Color.WHITE, 10));
+                chip.setPadding(dp(10), dp(2), dp(10), dp(2));
+                LinearLayout.LayoutParams cp = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+                cp.leftMargin = dp(6);
+                dirs.addView(chip, cp);
+            }
+        }
+        c.addView(dirs, matchWrap(6));
+
+        HashSet<String> dim = new HashSet<String>();
+        String[] allDirs = { "u", "d", "l", "r" };
+        for (int i = 0; i < allDirs.length; i++) if (!mine.contains(allDirs[i])) dim.add(allDirs[i]);
+        LinearLayout.LayoutParams pr = matchWrap(14);
+        pr.gravity = Gravity.CENTER_HORIZONTAL;
+        c.addView(padCluster("A\nĐẨY", "B\nLướt", 17, dim), pr);
+        c.addView(centerText("Cả đội lái CHUNG một quả bóng — chỉ hướng của bạn mới chạy theo tay bạn (hướng mờ không thuộc về bạn). Phối hợp đưa bóng chạm sao ⭐, né đạn!", 14, C_MUTED, false), matchWrap(12));
+        c.addView(timerLine("sec"), matchWrap(2));
+        return c;
+    }
+
+    // ---------- Đẩy Hộp Về Đích (co-op: push the crate together) ----------
+    private LinearLayout boxPush(JSONObject v, JSONObject g) {
+        clearPad(true);
+        LinearLayout c = col();
+        c.setGravity(Gravity.CENTER_HORIZONTAL);
+        if (!jStr(g, "phase", "").equals("box")) {
+            c.addView(centerText("Đợi…", 18, C_MUTED, false), matchWrap(30));
+            return c;
+        }
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER);
+        row.addView(text("📦 Đội đã giao: ", 20, C_TEXT, true));
+        TextView dv = text(String.valueOf(jInt(g, "deliveries", 0)), 22, accent(), true);
+        tvMineValue = dv;
+        row.addView(dv);
+        row.addView(text(" hộp", 20, C_TEXT, true));
+        c.addView(row, matchWrap(6));
+        LinearLayout.LayoutParams pr = matchWrap(16);
+        pr.gravity = Gravity.CENTER_HORIZONTAL;
+        c.addView(padCluster("A\nĐẨY", "B\nLướt", 17, null), pr);
+        c.addView(centerText("Cùng một đồng đội áp sát hộp và đẩy cùng một hướng — một người đẩy hộp không đi đâu cả!", 14, C_MUTED, false), matchWrap(12));
+        c.addView(timerLine("sec"), matchWrap(2));
+        return c;
+    }
+
+    // ---------- Chèo Thuyền (co-op: row on the beat) ----------
+    private LinearLayout rowBoat(JSONObject v, JSONObject g) {
+        LinearLayout c = col();
+        c.setGravity(Gravity.CENTER_HORIZONTAL);
+        if (!jStr(g, "phase", "").equals("row")) {
+            c.addView(centerText("Đợi…", 18, C_MUTED, false), matchWrap(30));
+            return c;
+        }
+        double dist = jDouble(g, "distance", 0);
+        int course = jInt(g, "course", 400);
+        TextView meta = centerText("Nhịp " + jInt(g, "beat", 1) + "/" + jInt(g, "beats", 45)
+            + " · Thuyền đã đi " + Math.round(dist) + "/" + course + " m", 19, C_TEXT, true);
+        tvRowMeta = meta;
+        c.addView(meta, matchWrap(6));
+
+        FrameLayout track = new FrameLayout(this);
+        GradientDrawable trk = new GradientDrawable();
+        trk.setColor(C_PANEL2);
+        trk.setCornerRadius(dp(7));
+        track.setBackground(trk);
+        View fill = new View(this);
+        GradientDrawable fl = new GradientDrawable();
+        fl.setColor(Color.parseColor("#38BDF8"));
+        fl.setCornerRadius(dp(7));
+        fill.setBackground(fl);
+        track.addView(fill, new FrameLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT));
+        rowTrack = track;
+        rowFill = fill;
+        c.addView(track, lp(ViewGroup.LayoutParams.MATCH_PARENT, dp(14), 8));
+
+        rowBgNorm = roundRect(Color.parseColor("#0369A1"), Color.parseColor("#38BDF8"), 22);
+        rowBgGold = roundRect(Color.parseColor("#FFC93D"), Color.WHITE, 22);
+        Button b = new Button(this);
+        b.setText("CHÈO!");
+        b.setTextSize(TypedValue.COMPLEX_UNIT_SP, 34);
+        b.setTypeface(Typeface.DEFAULT_BOLD);
+        b.setTextColor(Color.WHITE);
+        b.setAllCaps(false);
+        b.setBackground(rowBgNorm);
+        rowBtn = b;
+        LinearLayout.LayoutParams bp = lp(dp(250), dp(190), 14);
+        bp.gravity = Gravity.CENTER_HORIZONTAL;
+        c.addView(b, bp);
+        fireOnDown(b, new Runnable() {
+            @Override public void run() {
+                // No client lock: strokes are repeatable by design — the
+                // server dedupes to one stroke per player per beat and
+                // counts off-beat presses as splashes.
+                sendAction(actionBody("tap"), false);
+            }
+        });
+        c.addView(centerText("Bấm khi nút cháy VÀNG = đúng nhịp", 15, C_MUTED, false), matchWrap(8));
+
+        LinearLayout counts = new LinearLayout(this);
+        counts.setOrientation(LinearLayout.HORIZONTAL);
+        counts.setGravity(Gravity.CENTER);
+        counts.addView(text("Bạn trúng nhịp: ", 17, C_TEXT, true));
+        TextView hits = text(String.valueOf(jInt(g, "mine", 0)), 18, accent(), true);
+        tvRowHits = hits;
+        counts.addView(hits);
+        counts.addView(text(" · Trượt (tạt nước): ", 17, C_TEXT, true));
+        TextView spl = text(String.valueOf(jInt(g, "mySplash", 0)), 18, C_TEXT, true);
+        tvRowSplash = spl;
+        counts.addView(spl);
+        c.addView(counts, matchWrap(10));
         return c;
     }
 
