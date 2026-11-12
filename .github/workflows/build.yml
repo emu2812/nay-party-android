@@ -1,0 +1,68 @@
+name: Build APK
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build debug APK with SDK build-tools (no Gradle)
+        run: |
+          set -euo pipefail
+          SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          echo "Android SDK: $SDK"
+          ls "$SDK"
+          BT="$(ls "$SDK/build-tools" | sort -V | tail -n 1)"
+          PLAT="$(ls "$SDK/platforms" | sort -V | tail -n 1)"
+          echo "build-tools=$BT platform=$PLAT"
+          BTBIN="$SDK/build-tools/$BT"
+          AJAR="$SDK/platforms/$PLAT/android.jar"
+          test -f "$AJAR"
+
+          mkdir -p build/gen build/classes build/dex dist
+
+          # 1) Compile resources and link the base APK (also generates R.java)
+          "$BTBIN/aapt2" compile --dir res -o build/res.zip
+          "$BTBIN/aapt2" link -o build/app-base.apk \
+            -I "$AJAR" \
+            --manifest AndroidManifest.xml \
+            --java build/gen \
+            build/res.zip
+
+          # 2) Compile the Java sources against the Android platform jar
+          javac -encoding UTF-8 -source 8 -target 8 \
+            -bootclasspath "$AJAR" -cp "$AJAR" \
+            -d build/classes $(find src build/gen -name '*.java')
+
+          # 3) Dex
+          (cd build/classes && jar cf ../classes.jar .)
+          "$BTBIN/d8" --lib "$AJAR" --min-api 24 --output build/dex build/classes.jar
+
+          # 4) Pack the dex into the APK and align
+          cp build/app-base.apk build/app-unsigned.apk
+          (cd build/dex && zip -q ../app-unsigned.apk classes.dex)
+          "$BTBIN/zipalign" -f -p 4 build/app-unsigned.apk build/app-aligned.apk
+
+          # 5) Sign with a generated debug key
+          keytool -genkeypair -keystore build/debug.keystore \
+            -storepass android -keypass android \
+            -alias androiddebugkey -keyalg RSA -keysize 2048 \
+            -validity 10000 -dname "CN=Android Debug,O=Android,C=US" -noprompt
+          "$BTBIN/apksigner" sign \
+            --ks build/debug.keystore --ks-pass pass:android --key-pass pass:android \
+            --out dist/nay-party-controller.apk build/app-aligned.apk
+          "$BTBIN/apksigner" verify --verbose dist/nay-party-controller.apk
+          ls -la dist
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: nay-party-controller-apk
+          path: dist/*.apk
+          if-no-files-found: error
