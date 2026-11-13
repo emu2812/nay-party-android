@@ -79,6 +79,11 @@ public class MainActivity extends Activity {
         Color.parseColor("#4FA8E8"), Color.parseColor("#FFC93D") };
     private static final String[] MEM_NAME = { "Đỏ", "Xanh lá", "Xanh dương", "Vàng" };
     private static final String[] LETTERS = { "A", "B", "C", "D" };
+    // Giải Mã Chung symbols (worker DECODE_SYMBOLS: name + color per index)
+    private static final String[] SYM_NAME = { "ĐỎ", "XANH", "VÀNG", "HỒNG" };
+    private static final int[] SYM_HEX = {
+        Color.parseColor("#FF4757"), Color.parseColor("#3FA9F5"),
+        Color.parseColor("#FFC93D"), Color.parseColor("#F77FB0") };
 
     // pad bit indexes
     private static final int B_U = 0, B_D = 1, B_L = 2, B_R = 3, B_A = 4, B_B = 5;
@@ -112,6 +117,7 @@ public class MainActivity extends Activity {
     private TextView tvLives;           // arena lives
     private TextView tvMineValue;       // cuop-sao banked / crown hold / splat cells / box deliveries / shared checks
     private TextView tvHearts;          // chung-mot-than team hearts
+    private TextView tvDefendLine;      // thu-thanh crystal HP + team kills (updated in place)
     private TextView tvCrownLine;       // giu-vuong-mien holder banner (updated in place, no rebuild)
     // cheo-thuyen fast-ticker refs (beat flash runs off server-synced time)
     private Button rowBtn;
@@ -812,6 +818,53 @@ public class MainActivity extends Activity {
             } else if (gid.equals("day-hop") || gid.equals("cheo-thuyen")) {
                 // Steady screens: deliveries / beat stats update in place
                 // (cheo-thuyen also has its own 50ms beat ticker).
+            } else if (gid.equals("xe-tank") || gid.equals("dat-bom")) {
+                // Same deal as day-ra/ne-dan: rebuild only when my alive
+                // status flips; lives refresh in place via tvLives.
+                JSONObject blobs = jObj(g, "blobs");
+                JSONObject my = blobs == null ? null : jObj(blobs, String.valueOf(sSeat));
+                sb.append(':').append(my == null ? "?" : (jBool(my, "alive", true) ? "alive" : "ko"));
+            } else if (gid.equals("thu-thanh")) {
+                // Steady pad screen: crystal HP + kills refresh in place
+                // via tvDefendLine; rebuild only if I somehow get K.O.'d.
+                JSONObject blobs = jObj(g, "blobs");
+                JSONObject my = blobs == null ? null : jObj(blobs, String.valueOf(sSeat));
+                sb.append(':').append(my == null ? "?" : (jBool(my, "alive", true) ? "alive" : "ko"));
+            } else if (gid.equals("ke-gia-mao")) {
+                if (gp.equals("answer")) {
+                    boolean locked = g.opt("mine") instanceof Number
+                        || lockKey.equals("ke-gia-mao:a:" + round);
+                    sb.append(locked ? ":locked" : ":open");
+                } else if (gp.equals("discuss")) {
+                    // Rebuild when the public chat grows (same pattern as
+                    // chia-cuop); my half-typed message survives via the
+                    // draft field, exactly like the negotiation chat.
+                    JSONArray chat = jArr(g, "chatLog");
+                    if (chat != null) {
+                        for (int i = 0; i < chat.length(); i++) {
+                            JSONObject cm = chat.optJSONObject(i);
+                            if (cm != null) sb.append('|').append(jInt(cm, "seat", 0)).append(':').append(jStr(cm, "text", ""));
+                        }
+                    }
+                } else if (gp.equals("vote")) {
+                    boolean locked = g.opt("myVote") instanceof Number
+                        || lockKey.equals("ke-gia-mao:v:" + round);
+                    sb.append(locked ? ":locked" : ":open");
+                }
+            } else if (gid.equals("giai-ma-chung")) {
+                // Progress is rendered as text (step checkmarks, whose
+                // turn it is), so level/hearts/done/mySteps all belong
+                // to the structure — same choice as the web phone.
+                sb.append(':').append(jInt(g, "level", 0));
+                sb.append(':').append(jInt(g, "hearts", 0));
+                sb.append(':').append(jInt(g, "done", 0));
+                JSONArray ms = jArr(g, "mySteps");
+                if (ms != null) {
+                    for (int i = 0; i < ms.length(); i++) {
+                        JSONObject st = ms.optJSONObject(i);
+                        if (st != null) sb.append('|').append(jInt(st, "pos", 0)).append('=').append(jInt(st, "sym", -1));
+                    }
+                }
             }
             return sb.toString();
         }
@@ -834,10 +887,16 @@ public class MainActivity extends Activity {
             if (mine >= duaDisplay) duaDisplay = mine;
             tvMyCount.setText(String.valueOf(Math.max(duaDisplay, 0)));
         }
-        if ((gid.equals("day-ra") || gid.equals("ne-dan")) && tvLives != null) {
+        if ((gid.equals("day-ra") || gid.equals("ne-dan") || gid.equals("xe-tank") || gid.equals("dat-bom")) && tvLives != null) {
             JSONObject blobs = jObj(g, "blobs");
             JSONObject my = blobs == null ? null : jObj(blobs, String.valueOf(sSeat));
             if (my != null) tvLives.setText(hearts(jInt(my, "lives", 0)));
+        }
+        if (gid.equals("thu-thanh") && tvDefendLine != null) {
+            JSONObject crystal = jObj(g, "crystal");
+            int hp = crystal == null ? 10 : jInt(crystal, "hp", 10);
+            int max = crystal == null ? 10 : jInt(crystal, "max", 10);
+            tvDefendLine.setText("💎 Pha lê: " + hp + "/" + max + " · Đã hạ: " + jInt(g, "kills", 0) + " slime");
         }
         if (gid.equals("keo-co") && knotMarker != null && knotTrack != null) {
             int tw = knotTrack.getWidth();
@@ -911,7 +970,8 @@ public class MainActivity extends Activity {
                     if (!key.equals(lastVibKey)) { lastVibKey = key; vibrate(90); }
                 }
             }
-            if ((gid.equals("day-ra") || gid.equals("ne-dan")) && (gp.equals("arena") || gp.equals("dodge"))) {
+            if ((gid.equals("day-ra") || gid.equals("ne-dan") || gid.equals("xe-tank") || gid.equals("dat-bom"))
+                    && (gp.equals("arena") || gp.equals("dodge") || gp.equals("tank") || gp.equals("bomber"))) {
                 JSONObject blobs = jObj(g, "blobs");
                 JSONObject my = blobs == null ? null : jObj(blobs, String.valueOf(sSeat));
                 if (my != null) {
@@ -1401,6 +1461,11 @@ public class MainActivity extends Activity {
         if (gid.equals("chung-mot-than")) return new int[] { 0xFF2A1458, 0xFF0C0518 };
         if (gid.equals("day-hop")) return new int[] { 0xFF331D04, 0xFF120A01 };
         if (gid.equals("cheo-thuyen")) return new int[] { 0xFF083A56, 0xFF02101A };
+        if (gid.equals("xe-tank")) return new int[] { 0xFF0B2018, 0xFF060F0B };
+        if (gid.equals("dat-bom")) return new int[] { 0xFF241006, 0xFF120702 };
+        if (gid.equals("ke-gia-mao")) return new int[] { 0xFF1E0A38, 0xFF0C0516 };
+        if (gid.equals("thu-thanh")) return new int[] { 0xFF06222E, 0xFF02101A };
+        if (gid.equals("giai-ma-chung")) return new int[] { 0xFF191238, 0xFF08061A };
         return new int[] { C_PANEL, C_BG };
     }
 
@@ -1460,6 +1525,9 @@ public class MainActivity extends Activity {
         else if (gid.equals("chung-mot-than")) inner = sharedBody(v, g);
         else if (gid.equals("day-hop")) inner = boxPush(v, g);
         else if (gid.equals("cheo-thuyen")) inner = rowBoat(v, g);
+        else if (gid.equals("xe-tank") || gid.equals("dat-bom") || gid.equals("thu-thanh")) inner = gunPad(v, g);
+        else if (gid.equals("ke-gia-mao")) inner = keGiaMao(v, g);
+        else if (gid.equals("giai-ma-chung")) inner = giaiMaChung(v, g);
         else {
             inner = col();
             inner.addView(centerText("Đang chơi: " + jStr(g, "name", ""), 18, C_TEXT, true));
@@ -2110,6 +2178,76 @@ public class MainActivity extends Activity {
         return c;
     }
 
+    // ---------- Xe Tăng / Đặt Bom / Thủ Thành (gamepad + guns) ----------
+    // All three ride the same held-state pad channel: A is a rising-edge
+    // "burst" on the server (fires a shell / plants a bomb), B dashes.
+    private LinearLayout gunPad(JSONObject v, JSONObject g) {
+        clearPad(true); // a rebuilt screen must never inherit a stuck "held" bit
+        LinearLayout c = col();
+        c.setGravity(Gravity.CENTER_HORIZONTAL);
+        String gid = jStr(g, "id", "");
+        String gp = jStr(g, "phase", "");
+        boolean live = (gid.equals("xe-tank") && gp.equals("tank"))
+            || (gid.equals("dat-bom") && gp.equals("bomber"))
+            || (gid.equals("thu-thanh") && gp.equals("defend"));
+        if (!live) {
+            c.addView(centerText("Đợi vào sân…", 18, C_MUTED, false), matchWrap(30));
+            return c;
+        }
+        JSONObject blobs = jObj(g, "blobs");
+        JSONObject my = blobs == null ? null : jObj(blobs, String.valueOf(sSeat));
+        if (my == null) {
+            c.addView(centerText("Đang vào sân…", 18, C_MUTED, false), matchWrap(30));
+            return c;
+        }
+        if (!jBool(my, "alive", true)) {
+            TextView ko = centerText("K.O.!", 56, C_RED, true);
+            c.addView(ko, matchWrap(18));
+            c.addView(centerText("Bạn đã bị loại!", 24, C_TEXT, true), matchWrap(4));
+            c.addView(centerText("Xem TV đợi kết quả nhé…", 15, C_MUTED, false), matchWrap(4));
+            return c;
+        }
+        String aLabel;
+        float abSp = 17;
+        String hint;
+        if (gid.equals("thu-thanh")) {
+            // Co-op defence: no personal lives — the header tracks the
+            // crystal and the team's kills, refreshed in place.
+            JSONObject crystal = jObj(g, "crystal");
+            int hp = crystal == null ? 10 : jInt(crystal, "hp", 10);
+            int max = crystal == null ? 10 : jInt(crystal, "max", 10);
+            TextView line = centerText("💎 Pha lê: " + hp + "/" + max + " · Đã hạ: " + jInt(g, "kills", 0) + " slime",
+                19, C_TEXT, true);
+            tvDefendLine = line;
+            c.addView(line, matchWrap(6));
+            aLabel = "A\nBẮN";
+            hint = "Bắn slime trước khi chúng chạm vào pha lê · Nòng súng hướng theo hướng di chuyển cuối";
+        } else {
+            LinearLayout livesRow = new LinearLayout(this);
+            livesRow.setOrientation(LinearLayout.HORIZONTAL);
+            livesRow.setGravity(Gravity.CENTER);
+            livesRow.addView(text("Mạng của bạn: ", 17, C_TEXT, true));
+            TextView lv = text(hearts(jInt(my, "lives", 0)), 17, Color.parseColor("#FF8FA3"), true);
+            tvLives = lv;
+            livesRow.addView(lv);
+            c.addView(livesRow, matchWrap(6));
+            if (gid.equals("dat-bom")) {
+                aLabel = "A\nĐẶT BOM";
+                abSp = 13;
+                hint = "A: đặt bom (mỗi người 1 quả một lúc) · Bom nổ sau 2 giây theo hình chữ thập — đặt xong chạy ngay!";
+            } else {
+                aLabel = "A\nBẮN";
+                hint = "Nòng súng hướng theo hướng di chuyển cuối · A: bắn (hồi 1 giây) · Núp sau thùng chắn";
+            }
+        }
+        LinearLayout.LayoutParams pr = matchWrap(16);
+        pr.gravity = Gravity.CENTER_HORIZONTAL;
+        c.addView(padCluster(aLabel, "B\nLướt", abSp, null), pr);
+        c.addView(centerText(hint, 14, C_MUTED, false), matchWrap(12));
+        c.addView(timerLine("sec"), matchWrap(2));
+        return c;
+    }
+
     // ---------- Cao Bồi (duel: one huge button) ----------
     private LinearLayout caoBoi(JSONObject v, JSONObject g) {
         LinearLayout c = col();
@@ -2553,6 +2691,270 @@ public class MainActivity extends Activity {
         } else {
             c.addView(centerText("Đợi…", 18, C_MUTED, false), matchWrap(30));
         }
+        return c;
+    }
+
+    // ---------- Kẻ Giả Mạo ----------
+    private String impChatDraft = "";
+
+    private LinearLayout keGiaMao(JSONObject v, JSONObject g) {
+        LinearLayout c = col();
+        String gp = jStr(g, "phase", "");
+        final int round = jInt(g, "round", 0);
+        if (gp.equals("answer")) {
+            c.setGravity(Gravity.CENTER_HORIZONTAL);
+            TextView chip = centerText("Chủ đề: " + jStr(g, "category", ""), 15, C_MUTED, true);
+            chip.setBackground(roundRect(C_PANEL2, accent(), 999));
+            chip.setPadding(dp(14), dp(6), dp(14), dp(6));
+            LinearLayout.LayoutParams chp = lp(ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT, 4);
+            chp.gravity = Gravity.CENTER_HORIZONTAL;
+            c.addView(chip, chp);
+            // PRIVACY: myQuestion is the only question this seat ever
+            // receives (real or variant) — render exactly that, nothing else.
+            c.addView(text(jStr(g, "myQuestion", ""), 21, C_TEXT, true), matchWrap(12));
+            c.addView(timerLine("sec"), matchWrap(2));
+            Object mine = g.opt("mine");
+            boolean locked = mine instanceof Number || lockKey.equals("ke-gia-mao:a:" + round);
+            if (!locked) {
+                JSONArray opts = jArr(g, "options");
+                LinearLayout grid = col();
+                for (int r = 0; r < 2; r++) {
+                    LinearLayout rowL = new LinearLayout(this);
+                    rowL.setOrientation(LinearLayout.HORIZONTAL);
+                    for (int k = 0; k < 2; k++) {
+                        final int idx = r * 2 + k;
+                        String label = LETTERS[idx] + ". " + (opts == null ? "" : opts.optString(idx, ""));
+                        Button b = bigButton(label, Color.parseColor("#2E4A7A"), accent(), 18);
+                        LinearLayout.LayoutParams bp = new LinearLayout.LayoutParams(0, dp(84), 1f);
+                        if (k == 1) bp.leftMargin = dp(10);
+                        rowL.addView(b, bp);
+                        fireOnDown(b, new Runnable() {
+                            @Override public void run() {
+                                if (lockKey.equals("ke-gia-mao:a:" + round)) return;
+                                lockKey = "ke-gia-mao:a:" + round;
+                                JSONObject bdy = actionBody("answer");
+                                try { bdy.put("choice", idx); } catch (Exception ignored) { }
+                                vibrate(25);
+                                sendAction(bdy, true);
+                            }
+                        });
+                    }
+                    grid.addView(rowL, matchWrap(r == 0 ? 12 : 10));
+                }
+                c.addView(grid);
+                c.addView(centerText("Trả lời bí mật — đừng đọc to câu hỏi hay đáp án của bạn!", 14, C_MUTED, false), matchWrap(10));
+            } else {
+                c.addView(centerText("Đã trả lời! Đợi mọi người…", 22, C_TEXT, true), matchWrap(24));
+            }
+        } else if (gp.equals("discuss")) {
+            c.addView(centerText("Bàn luận: ai đang giả vờ?", 21, C_TEXT, true), matchWrap(2));
+            // Public discussion — EVERY player may chat here (unlike Chia
+            // Hay Cướp's pair-only negotiation).
+            LinearLayout msgs = col();
+            JSONArray chat = jArr(g, "chatLog");
+            if (chat != null) {
+                for (int i = 0; i < chat.length(); i++) {
+                    JSONObject cm = chat.optJSONObject(i);
+                    if (cm == null) continue;
+                    JSONObject who = playerBySeat(v, jInt(cm, "seat", -1));
+                    TextView line = text((who == null ? "" : jStr(who, "name", "")) + ": " + jStr(cm, "text", ""),
+                        16, C_TEXT, jInt(cm, "seat", -1) == sSeat);
+                    line.setBackground(roundRect(C_PANEL2, C_PANEL2, 12));
+                    line.setPadding(dp(12), dp(8), dp(12), dp(8));
+                    msgs.addView(line, matchWrap(6));
+                }
+            }
+            final ScrollView sv = new ScrollView(this);
+            sv.addView(msgs);
+            LinearLayout.LayoutParams svp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f);
+            svp.topMargin = dp(8);
+            c.addView(sv, svp);
+            sv.post(new Runnable() {
+                @Override public void run() { sv.fullScroll(View.FOCUS_DOWN); }
+            });
+            LinearLayout rowL = new LinearLayout(this);
+            rowL.setOrientation(LinearLayout.HORIZONTAL);
+            final EditText chatIn = new EditText(this);
+            chatIn.setInputType(InputType.TYPE_CLASS_TEXT);
+            chatIn.setFilters(new android.text.InputFilter[] { new android.text.InputFilter.LengthFilter(60) });
+            chatIn.setTextSize(TypedValue.COMPLEX_UNIT_SP, 17);
+            chatIn.setTextColor(C_TEXT);
+            chatIn.setHintTextColor(C_MUTED);
+            chatIn.setHint("Nói gì đó…");
+            chatIn.setBackground(roundRect(C_PANEL2, accent(), 14));
+            chatIn.setPadding(dp(12), dp(8), dp(12), dp(8));
+            chatIn.setText(impChatDraft);
+            chatIn.setSelection(chatIn.getText().length());
+            chatIn.addTextChangedListener(new android.text.TextWatcher() {
+                @Override public void beforeTextChanged(CharSequence s, int a, int b, int n) { }
+                @Override public void onTextChanged(CharSequence s, int a, int b, int n) { impChatDraft = s.toString(); }
+                @Override public void afterTextChanged(android.text.Editable s) { }
+            });
+            rowL.addView(chatIn, new LinearLayout.LayoutParams(0, dp(52), 1f));
+            Button send = bigButton("Gửi", Color.parseColor("#2F7FBF"), Color.parseColor("#6DB6F2"), 17);
+            LinearLayout.LayoutParams sbp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, dp(52));
+            sbp.leftMargin = dp(8);
+            rowL.addView(send, sbp);
+            send.setOnClickListener(new View.OnClickListener() {
+                @Override public void onClick(View vw) {
+                    String txt = chatIn.getText().toString().trim();
+                    if (txt.length() == 0) { toast("Nhập lời nhắn trước đã."); return; }
+                    impChatDraft = "";
+                    chatIn.setText("");
+                    JSONObject bdy = actionBody("chat");
+                    try { bdy.put("text", txt); } catch (Exception ignored) { }
+                    sendAction(bdy, true);
+                }
+            });
+            c.addView(rowL, matchWrap(10));
+            c.addView(centerText("Đừng lộ đáp án của bạn — kẻ giả mạo đang nghe đấy!", 14, C_MUTED, false), matchWrap(6));
+            c.addView(timerLine("sec"), matchWrap(2));
+        } else if (gp.equals("vote")) {
+            c.setGravity(Gravity.CENTER_HORIZONTAL);
+            Object myVote = g.opt("myVote");
+            boolean locked = myVote instanceof Number || lockKey.equals("ke-gia-mao:v:" + round);
+            if (!locked) {
+                c.addView(centerText("Bạn tố cáo ai là kẻ giả mạo?", 23, C_TEXT, true), matchWrap(14));
+                JSONArray ps = jArr(v, "players");
+                if (ps != null) {
+                    for (int i = 0; i < ps.length(); i++) {
+                        JSONObject p = ps.optJSONObject(i);
+                        if (p == null) continue;
+                        final int targetSeat = jInt(p, "seat", -1);
+                        if (targetSeat == sSeat || targetSeat < 0) continue;
+                        Integer pc = SEAT_HEX.get(jStr(p, "color", "blue"));
+                        Button b = bigButton(jStr(p, "name", ""), pc != null ? pc : C_PANEL2, Color.WHITE, 20);
+                        c.addView(b, lp(ViewGroup.LayoutParams.MATCH_PARENT, dp(60), 10));
+                        fireOnDown(b, new Runnable() {
+                            @Override public void run() {
+                                if (lockKey.equals("ke-gia-mao:v:" + round)) return;
+                                lockKey = "ke-gia-mao:v:" + round;
+                                JSONObject bdy = actionBody("vote");
+                                try { bdy.put("seat", targetSeat); } catch (Exception ignored) { }
+                                vibrate(25);
+                                sendAction(bdy, true);
+                            }
+                        });
+                    }
+                }
+                c.addView(timerLine("sec"), matchWrap(8));
+            } else {
+                c.addView(centerText("Đã tố cáo! Đợi công bố…", 24, C_TEXT, true), matchWrap(30));
+                if (myVote instanceof Number) {
+                    JSONObject who = playerBySeat(v, ((Number) myVote).intValue());
+                    if (who != null) c.addView(centerText("Bạn đã tố cáo: " + jStr(who, "name", ""), 17, C_MUTED, false), matchWrap(6));
+                }
+            }
+        } else if (gp.equals("reveal")) {
+            JSONObject rev = jObj(g, "reveal");
+            if (rev == null) {
+                c.addView(centerText("Đang công bố…", 20, C_MUTED, false), matchWrap(30));
+            } else {
+                c.setGravity(Gravity.CENTER_HORIZONTAL);
+                boolean caught = jBool(rev, "caught", false);
+                c.addView(centerText(caught ? "🎉 Bắt được kẻ giả mạo!" : "😈 Kẻ giả mạo đã thoát!",
+                    27, caught ? C_GREEN : C_RED, true), matchWrap(16));
+                int impSeat = jInt(rev, "impostor", -1);
+                JSONObject imp = playerBySeat(v, impSeat);
+                c.addView(centerText("Kẻ giả mạo: " + (imp == null ? "" : jStr(imp, "name", ""))
+                    + (impSeat == sSeat ? " — chính là BẠN!" : ""), 20, C_TEXT, true), matchWrap(8));
+                c.addView(text("Câu hỏi thật: " + jStr(rev, "realQ", ""), 16, C_TEXT, false), matchWrap(10));
+                c.addView(text("Câu hỏi giả: " + jStr(rev, "fakeQ", ""), 16, C_MUTED, false), matchWrap(4));
+                JSONObject pts = jObj(rev, "points");
+                int my = pts == null ? 0 : pts.optInt(String.valueOf(sSeat), 0);
+                c.addView(centerText("+" + fmt(my) + " điểm vòng này", 24, C_GREEN, true), matchWrap(12));
+            }
+        } else {
+            c.addView(centerText("Đợi…", 18, C_MUTED, false), matchWrap(30));
+        }
+        return c;
+    }
+
+    // ---------- Giải Mã Chung (co-op: each player holds part of the code) ----------
+    private LinearLayout giaiMaChung(JSONObject v, JSONObject g) {
+        LinearLayout c = col();
+        c.setGravity(Gravity.CENTER_HORIZONTAL);
+        final String gp = jStr(g, "phase", "");
+        if (!gp.equals("decode") && !gp.equals("levelup")) {
+            c.addView(centerText("Đợi…", 18, C_MUTED, false), matchWrap(30));
+            return c;
+        }
+        int done = jInt(g, "done", 0);
+        int total = jInt(g, "total", 0);
+        c.addView(centerText("Màn " + jInt(g, "level", 1) + " · Tim đội: "
+            + hearts(Math.max(0, jInt(g, "hearts", 0))) + " · Đã qua " + jInt(g, "levelsDone", 0) + " màn",
+            18, C_TEXT, true), matchWrap(4));
+        c.addView(centerText("Tiến độ màn này: " + done + "/" + total + " bước", 17, C_MUTED, true), matchWrap(2));
+        if (gp.equals("levelup")) {
+            c.addView(centerText("QUA MÀN! 🎉", 30, C_GREEN, true), matchWrap(8));
+        }
+        c.addView(text("Phần mật mã của bạn:", 16, C_MUTED, true), matchWrap(10));
+        // SECRECY: mySteps lists ONLY this seat's steps (pos + symbol) —
+        // the current-step highlight is derived from the public progress
+        // counter plus my own list, never from anyone else's steps.
+        JSONArray ms = jArr(g, "mySteps");
+        boolean myTurn = false;
+        if (ms == null || ms.length() == 0) {
+            c.addView(centerText("Màn này bạn không giữ bước nào — cổ vũ đồng đội nhé!", 15, C_TEXT, false), matchWrap(4));
+        } else {
+            for (int i = 0; i < ms.length(); i++) {
+                JSONObject st = ms.optJSONObject(i);
+                if (st == null) continue;
+                int pos = jInt(st, "pos", 0);
+                int sym = jInt(st, "sym", -1);
+                String nm = jStr(st, "name", (sym >= 0 && sym < SYM_NAME.length) ? SYM_NAME[sym] : "");
+                int symColor = (sym >= 0 && sym < SYM_HEX.length) ? SYM_HEX[sym] : C_MUTED;
+                boolean isDone = pos <= done;
+                boolean isCurrent = gp.equals("decode") && pos == done + 1;
+                if (isCurrent) myTurn = true;
+                String label = (isDone ? "✓ " : isCurrent ? "👉 " : "")
+                    + "Bước " + pos + ": " + nm + (isCurrent ? " — TỚI LƯỢT BẠN!" : "");
+                TextView stepChip = centerText(label, 18, isCurrent ? C_TEXT : symColor, true);
+                stepChip.setBackground(roundRect(isCurrent ? C_PANEL : C_PANEL2, symColor, 12));
+                stepChip.setPadding(dp(14), dp(8), dp(14), dp(8));
+                if (isDone) stepChip.setAlpha(0.55f);
+                LinearLayout.LayoutParams scp = lp(ViewGroup.LayoutParams.WRAP_CONTENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT, 6);
+                scp.gravity = Gravity.CENTER_HORIZONTAL;
+                c.addView(stepChip, scp);
+            }
+        }
+        if (gp.equals("decode") && total > 0) {
+            c.addView(centerText(myTurn
+                    ? "Tới lượt bạn — bấm đúng ký hiệu của bước " + (done + 1) + "!"
+                    : "Đợi đồng đội bấm bước " + (done + 1) + "…",
+                15, myTurn ? Color.parseColor("#FFC93D") : C_MUTED, true), matchWrap(8));
+        }
+        LinearLayout grid = col();
+        for (int r = 0; r < 2; r++) {
+            LinearLayout rowL = new LinearLayout(this);
+            rowL.setOrientation(LinearLayout.HORIZONTAL);
+            for (int k = 0; k < 2; k++) {
+                final int idx = r * 2 + k;
+                Button b = bigButton(SYM_NAME[idx], SYM_HEX[idx], Color.WHITE, 20);
+                LinearLayout.LayoutParams bp = new LinearLayout.LayoutParams(0, dp(84), 1f);
+                if (k == 1) bp.leftMargin = dp(10);
+                rowL.addView(b, bp);
+                fireOnDown(b, new Runnable() {
+                    @Override public void run() {
+                        // No client lock: the server adjudicates every
+                        // press (owner + symbol); a wrong press costs the
+                        // team a heart by design.
+                        if (!gp.equals("decode")) return;
+                        JSONObject bdy = actionBody("symbol");
+                        try { bdy.put("sym", idx); } catch (Exception ignored) { }
+                        sendAction(bdy, false);
+                    }
+                });
+            }
+            grid.addView(rowL, matchWrap(r == 0 ? 12 : 10));
+        }
+        c.addView(grid);
+        c.addView(centerText("Chỉ bấm khi tới lượt bước của bạn và đúng ký hiệu của bước đó — bấm sai cả đội mất 1 tim!", 14, C_MUTED, false), matchWrap(10));
+        c.addView(timerLine("sec"), matchWrap(2));
         return c;
     }
 }

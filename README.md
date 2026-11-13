@@ -33,6 +33,19 @@ không qua webview, chạm là ăn ngay ở tầng hệ điều hành.
    - **Chèo Thuyền** (hợp tác) — nút CHÈO khổng lồ tự cháy VÀNG đúng cửa sổ
      nhịp (±260ms, tính theo giờ máy chủ đã đồng bộ), hiện số lần trúng
      nhịp / tạt nước của mình.
+   - **Xe Tăng Đấu Trường** — gamepad (A: BẮN, B: Lướt), nòng súng hướng
+     theo hướng di chuyển cuối, hiện số mạng, rung khi mất mạng / bị loại.
+   - **Đặt Bom** — gamepad (A: ĐẶT BOM, B: Lướt), đặt xong chạy ngay —
+     bom nổ sau 2 giây theo hình chữ thập; hiện số mạng.
+   - **Kẻ Giả Mạo** — mỗi vòng: đọc câu hỏi *của riêng mình* + 4 đáp án
+     (khoá ngay khi chọn), qua pha bàn luận có ô chat chung cho cả phòng,
+     rồi bấm tố cáo từng người chơi khác; màn công bố hiện kẻ giả mạo,
+     cả hai câu hỏi thật/giả và điểm của mình.
+   - **Thủ Thành** (hợp tác) — gamepad (A: BẮN, B: Lướt), header hiện
+     máu pha lê + số slime cả đội đã hạ, cập nhật tại chỗ.
+   - **Giải Mã Chung** (hợp tác) — danh sách các bước mật mã *chỉ của
+     mình* (bước đã xong có ✓, bước tới lượt mình có 👉), 4 nút ký hiệu
+     ĐỎ / XANH / VÀNG / HỒNG, header hiện màn + tim đội + tiến độ.
    - Game hợp tác: màn kết quả và bục vinh quang hiện **banner thành tích
      đội** (hạng + điểm mỗi người + thành tích đội) giống bản web.
 4. App rung khi trả lời đúng, thắng vòng, mất mạng/bị loại (giống bản web),
@@ -58,4 +71,5 @@ App nói chuyện với cùng room API của worker Nảy Party:
 - `POST /api/rooms/:code/join` `{name}` → `{seat, playerToken, color}`
 - `GET /api/rooms/:code/state?role=player&token=…` (poll ~300ms)
 - `POST /api/rooms/:code/action` `{role:"player", token, action, …}` với các
-  action `tap`, `answer`, `guess`, `color`, `pad {u,d,l,r,a,b}`, `choose`, `chat`
+  action `tap`, `answer`, `guess`, `color`, `pad {u,d,l,r,a,b}`, `choose`, `chat`,
+  `vote {seat}` (Kẻ Giả Mạo), `symbol {sym}` (Giải Mã Chung)
