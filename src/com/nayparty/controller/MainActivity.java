@@ -3,6 +3,7 @@ package com.nayparty.controller;
 import android.app.Activity;
 import android.content.Context;
 import android.content.SharedPreferences;
+import android.content.res.Configuration;
 import android.graphics.Color;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
@@ -11,6 +12,7 @@ import android.os.Handler;
 import android.os.Looper;
 import android.os.Vibrator;
 import android.text.InputType;
+import android.util.DisplayMetrics;
 import android.util.TypedValue;
 import android.view.Gravity;
 import android.view.MotionEvent;
@@ -206,6 +208,24 @@ public class MainActivity extends Activity {
     }
 
     @Override
+    public void onConfigurationChanged(Configuration newConfig) {
+        super.onConfigurationChanged(newConfig);
+        // configChanges keeps this activity alive across rotation, so a
+        // programmatically built screen would keep its old-orientation
+        // geometry. Rebuild the room screen from the last known state via
+        // the normal applyView path (forcing the rebuild branch); the
+        // screen builders clearPad() first, so a direction held through
+        // the rotation can never stick on the server, and the session
+        // (room, token, seat) is untouched. Off-room screens are fluid
+        // columns that reflow on their own — rebuilding them would lose
+        // half-typed join input.
+        if (!destroyed && inRoom && view != null) {
+            currentSig = "";
+            applyView(view);
+        }
+    }
+
+    @Override
     public void onBackPressed() {
         if (inRoom) { leaveRoom(null); return; }
         super.onBackPressed();
@@ -396,14 +416,21 @@ public class MainActivity extends Activity {
         InputStream is = r.status >= 400 ? c.getErrorStream() : c.getInputStream();
         r.body = "";
         if (is != null) {
+            // Read the body to EOF and close the stream, but never call
+            // disconnect(): with the stream fully consumed, the platform
+            // keep-alive pool can reuse this connection, so the next poll
+            // or pad send skips a fresh TCP+TLS handshake — a full
+            // round-trip tax on every request over slow mobile data.
             BufferedReader br = new BufferedReader(new InputStreamReader(is, "UTF-8"));
-            StringBuilder sb = new StringBuilder();
-            String line;
-            while ((line = br.readLine()) != null) sb.append(line);
-            br.close();
-            r.body = sb.toString();
+            try {
+                StringBuilder sb = new StringBuilder();
+                String line;
+                while ((line = br.readLine()) != null) sb.append(line);
+                r.body = sb.toString();
+            } finally {
+                br.close();
+            }
         }
-        c.disconnect();
         return r;
     }
 
@@ -545,7 +572,7 @@ public class MainActivity extends Activity {
                         handlePoll(fr, fe);
                         ui.postDelayed(new Runnable() {
                             @Override public void run() { pollOnce(gen); }
-                        }, 300);
+                        }, 250);
                     }
                 });
             }
@@ -615,20 +642,43 @@ public class MainActivity extends Activity {
         return b;
     }
 
-    /** Ordered pad channel: every pad snapshot goes through one thread. */
+    // Latest-wins pad channel: a snapshot is state, not an event, so a
+    // stale backlog must never queue up behind a slow connection — only
+    // the newest snapshot is worth sending. One drain task on padExec
+    // sends the pending snapshot and loops while a newer one lands
+    // mid-send, so the final state (e.g. clearPad's all-zeros release)
+    // is always flushed and never dropped. Kéo Co presses are events,
+    // not state: they keep their own strictly ordered posts (see
+    // sendTugPress) and are never coalesced.
+    private final Object padSlotLock = new Object();
+    private JSONObject pendingPad = null;
+    private boolean padDrainScheduled = false;
+
     private void sendPadSnapshot(final JSONObject pad) {
-        padExec.execute(new Runnable() {
-            @Override public void run() {
-                JSONObject b = actionBody("pad");
-                try {
-                    b.put("role", "player");
-                    b.put("token", sToken);
-                    b.put("pad", pad);
-                } catch (Exception ignored) { }
-                try { http("POST", "/api/rooms/" + sCode + "/action", b); }
-                catch (Exception ignored) { }
-            }
-        });
+        synchronized (padSlotLock) {
+            pendingPad = pad;
+            if (padDrainScheduled) return;
+            padDrainScheduled = true;
+        }
+        try {
+            padExec.execute(new Runnable() {
+                @Override public void run() {
+                    for (;;) {
+                        JSONObject p;
+                        synchronized (padSlotLock) {
+                            p = pendingPad;
+                            pendingPad = null;
+                            if (p == null) { padDrainScheduled = false; return; }
+                        }
+                        postPadSync(p);
+                    }
+                }
+            });
+        } catch (RuntimeException e) {
+            // Executor already shut down (onDestroy race): keep the slot
+            // bookkeeping consistent instead of wedging future sends.
+            synchronized (padSlotLock) { padDrainScheduled = false; }
+        }
     }
 
     private JSONObject padJson() {
@@ -1043,7 +1093,7 @@ public class MainActivity extends Activity {
     // Mirrors the web client's rowbtn flash: the CHÈO button burns gold
     // inside the +-260ms stroke window around each 1000ms beat, computed
     // client-side from server-synced time (serverOffset) so it stays
-    // smooth between the 300ms polls.
+    // smooth between the 250ms polls.
 
     private void startRowLoop() {
         ui.postDelayed(new Runnable() {
@@ -1548,7 +1598,7 @@ public class MainActivity extends Activity {
                 c.addView(centerText("−100 điểm vòng này. Đợi vòng sau nhé.", 16, C_TEXT, false), matchWrap(6));
             } else {
                 Button b = bigButton("ĐỢI…\nĐừng bấm vội!", C_RED, 0xFFFF8A8A, 30);
-                LinearLayout.LayoutParams p = lp(dp(270), dp(270), 26);
+                LinearLayout.LayoutParams p = lp(dp(fitSquareDp(270)), dp(fitSquareDp(270)), 26);
                 p.gravity = Gravity.CENTER_HORIZONTAL;
                 c.addView(b, p);
                 fireOnDown(b, new Runnable() {
@@ -1564,7 +1614,7 @@ public class MainActivity extends Activity {
                 c.addView(centerText("Đã bấm! Đợi kết quả…", 26, C_TEXT, true), matchWrap(40));
             } else {
                 Button b = bigButton("BẤM NGAY!", Color.parseColor("#1FA855"), C_GREEN, 32);
-                LinearLayout.LayoutParams p = lp(dp(270), dp(270), 26);
+                LinearLayout.LayoutParams p = lp(dp(fitSquareDp(270)), dp(fitSquareDp(270)), 26);
                 p.gravity = Gravity.CENTER_HORIZONTAL;
                 c.addView(b, p);
                 fireOnDown(b, new Runnable() {
@@ -1970,66 +2020,8 @@ public class MainActivity extends Activity {
         livesRow.addView(lv);
         c.addView(livesRow, matchWrap(6));
 
-        LinearLayout padRow = new LinearLayout(this);
-        padRow.setOrientation(LinearLayout.HORIZONTAL);
-        padRow.setGravity(Gravity.CENTER);
-
-        // D-pad (3x3 grid)
-        LinearLayout dpad = col();
-        int DB = dp(62);
-        int[][] bits = {
-            { -1, B_U, -1 },
-            { B_L, -1, B_R },
-            { -1, B_D, -1 } };
-        String[][] labels = {
-            { "", "▲", "" },
-            { "◀", "", "▶" },
-            { "", "▼", "" } };
-        for (int r = 0; r < 3; r++) {
-            LinearLayout rowL = new LinearLayout(this);
-            rowL.setOrientation(LinearLayout.HORIZONTAL);
-            for (int k = 0; k < 3; k++) {
-                if (bits[r][k] < 0) {
-                    View empty = new View(this);
-                    rowL.addView(empty, new LinearLayout.LayoutParams(DB, DB));
-                } else {
-                    PadButton b = new PadButton(bits[r][k], labels[r][k],
-                        C_PANEL2, Color.parseColor("#6DB6F2"), 16);
-                    LinearLayout.LayoutParams bp = new LinearLayout.LayoutParams(DB, DB);
-                    if (k > 0) bp.leftMargin = dp(4);
-                    rowL.addView(b, bp);
-                }
-            }
-            LinearLayout.LayoutParams rp = new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-            if (r > 0) rp.topMargin = dp(4);
-            dpad.addView(rowL, rp);
-        }
-        padRow.addView(dpad);
-
-        View gap = new View(this);
-        padRow.addView(gap, new LinearLayout.LayoutParams(dp(26), 1));
-
-        // A / B cluster (offset like a real gamepad)
-        LinearLayout ab = col();
-        LinearLayout rowA = new LinearLayout(this);
-        rowA.setOrientation(LinearLayout.HORIZONTAL);
-        View spA = new View(this);
-        rowA.addView(spA, new LinearLayout.LayoutParams(dp(38), 1));
-        PadButton btnA = new PadButton(B_A, "A\nĐẨY", Color.parseColor("#B03030"),
-            Color.parseColor("#FF6B6B"), 999);
-        rowA.addView(btnA, new LinearLayout.LayoutParams(dp(84), dp(84)));
-        ab.addView(rowA);
-        LinearLayout rowB = new LinearLayout(this);
-        rowB.setOrientation(LinearLayout.HORIZONTAL);
-        PadButton btnB = new PadButton(B_B, "B\nLướt", Color.parseColor("#2F7FBF"),
-            Color.parseColor("#6DB6F2"), 999);
-        rowB.addView(btnB, new LinearLayout.LayoutParams(dp(84), dp(84)));
-        LinearLayout.LayoutParams rb = new LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        rb.topMargin = dp(6);
-        ab.addView(rowB, rb);
-        padRow.addView(ab);
+        // Same adaptive cluster as every other gamepad screen.
+        LinearLayout padRow = padCluster("A\nĐẨY", "B\nLướt", 17, null);
 
         LinearLayout.LayoutParams pr = matchWrap(16);
         pr.gravity = Gravity.CENTER_HORIZONTAL;
@@ -2041,19 +2033,83 @@ public class MainActivity extends Activity {
         return c;
     }
 
+    // ---- adaptive gamepad geometry -------------------------------------
+    // The cluster's design size is 342dp wide (D-pad 194 + gap 26 + A/B
+    // column 122) and 194dp tall, but the stage only offers the screen
+    // minus the room root (14dp x2) and stage panel (16dp x2) padding —
+    // on narrow phones and with enlarged display-size settings the fixed
+    // geometry overflowed and the A button was clipped at the right
+    // edge. So the whole cluster scales by the tightest budget; in
+    // landscape the A/B column anchors right with a flexible gap between
+    // the two halves, like holding a real gamepad.
+    private static class PadGeom {
+        int cell;       // D-pad button size (px)
+        int cellGap;    // gap between D-pad cells (px)
+        int midGap;     // fixed D-pad <-> A/B gap (px; unused when flexGap)
+        boolean flexGap;
+        int spacer;     // A-row indent (px)
+        int ab;         // A/B button size (px)
+        int abGap;      // vertical gap between the A and B rows (px)
+        float scale;
+    }
+
+    private PadGeom computePadGeom() {
+        DisplayMetrics dm = getResources().getDisplayMetrics();
+        float wDp = dm.widthPixels / dm.density;
+        float hDp = dm.heightPixels / dm.density;
+        boolean land = wDp > hDp;
+        float availW = wDp - 62f; // root + panel padding + 2dp safety
+        // Height budget: the fixed chrome around the cluster on the
+        // gamepad screens (status bar, root padding, room header, panel
+        // padding, the screen's own status line, cluster margin, hint
+        // and timer lines) totals ~244dp.
+        float sH = (hDp - 244f) / 194f;
+        // Landscape width is plentiful; only a 16dp minimum gap is fixed
+        // and the rest flexes. Portrait must fit the full 342dp design.
+        float sW = land ? (availW - 16f) / 316f : availW / 342f;
+        float s = Math.min(1f, Math.min(sW, sH));
+        if (s < 0.5f) s = 0.5f;
+        PadGeom g = new PadGeom();
+        g.scale = s;
+        g.cell = dp(62f * s);
+        g.cellGap = Math.max(dp(2), dp(4f * s));
+        g.midGap = dp(26f * s);
+        g.flexGap = land;
+        g.spacer = dp(38f * s);
+        g.ab = dp(84f * s);
+        g.abGap = Math.max(dp(2), dp(6f * s));
+        return g;
+    }
+
+    /** Side length (dp) for the full-screen single tap buttons (Nhanh
+     *  Tay, Cao Bồi): the design size, capped so the button always fits
+     *  the stage — by width first, and in landscape by the height left
+     *  after the ~180dp of fixed chrome around a button-only screen. */
+    private int fitSquareDp(float wantDp) {
+        DisplayMetrics dm = getResources().getDisplayMetrics();
+        float wDp = dm.widthPixels / dm.density;
+        float hDp = dm.heightPixels / dm.density;
+        float max = wDp - 64f;
+        if (wDp > hDp) max = Math.min(max, hDp - 180f);
+        if (max < 110f) max = 110f;
+        return (int) Math.min(wantDp, max);
+    }
+
     /**
      * Shared D-pad + A/B cluster for the newer games (same geometry as the
      * day-ra/ne-dan pad). dimDirs holds direction keys ("u","d","l","r")
      * to render dimmed — used by Chung Một Thân, where only the directions
      * a player owns are live (the server filters the rest anyway).
+     * Geometry is adaptive (see computePadGeom): it always fits the stage.
      */
     private LinearLayout padCluster(String aLabel, String bLabel, float abSp, HashSet<String> dimDirs) {
+        PadGeom pg = computePadGeom();
         LinearLayout padRow = new LinearLayout(this);
         padRow.setOrientation(LinearLayout.HORIZONTAL);
         padRow.setGravity(Gravity.CENTER);
 
         LinearLayout dpad = col();
-        int DB = dp(62);
+        int DB = pg.cell;
         int[][] bits = {
             { -1, B_U, -1 },
             { B_L, -1, B_R },
@@ -2075,40 +2131,45 @@ public class MainActivity extends Activity {
                     rowL.addView(empty, new LinearLayout.LayoutParams(DB, DB));
                 } else {
                     PadButton b = new PadButton(bits[r][k], labels[r][k],
-                        C_PANEL2, Color.parseColor("#6DB6F2"), 16);
+                        C_PANEL2, Color.parseColor("#6DB6F2"), 16, Math.max(10f, 16f * pg.scale));
                     if (dimDirs != null && dimDirs.contains(keys[r][k])) b.setAlpha(0.35f);
                     LinearLayout.LayoutParams bp = new LinearLayout.LayoutParams(DB, DB);
-                    if (k > 0) bp.leftMargin = dp(4);
+                    if (k > 0) bp.leftMargin = pg.cellGap;
                     rowL.addView(b, bp);
                 }
             }
             LinearLayout.LayoutParams rp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-            if (r > 0) rp.topMargin = dp(4);
+            if (r > 0) rp.topMargin = pg.cellGap;
             dpad.addView(rowL, rp);
         }
         padRow.addView(dpad);
 
         View gap = new View(this);
-        padRow.addView(gap, new LinearLayout.LayoutParams(dp(26), 1));
+        if (pg.flexGap) {
+            // Landscape grip: D-pad left, A/B right, space flexes between.
+            padRow.addView(gap, new LinearLayout.LayoutParams(0, 1, 1f));
+        } else {
+            padRow.addView(gap, new LinearLayout.LayoutParams(pg.midGap, 1));
+        }
 
         LinearLayout ab = col();
         LinearLayout rowA = new LinearLayout(this);
         rowA.setOrientation(LinearLayout.HORIZONTAL);
         View spA = new View(this);
-        rowA.addView(spA, new LinearLayout.LayoutParams(dp(38), 1));
+        rowA.addView(spA, new LinearLayout.LayoutParams(pg.spacer, 1));
         PadButton btnA = new PadButton(B_A, aLabel, Color.parseColor("#B03030"),
-            Color.parseColor("#FF6B6B"), 999, abSp);
-        rowA.addView(btnA, new LinearLayout.LayoutParams(dp(84), dp(84)));
+            Color.parseColor("#FF6B6B"), 999, Math.max(10.5f, abSp * pg.scale));
+        rowA.addView(btnA, new LinearLayout.LayoutParams(pg.ab, pg.ab));
         ab.addView(rowA);
         LinearLayout rowB = new LinearLayout(this);
         rowB.setOrientation(LinearLayout.HORIZONTAL);
         PadButton btnB = new PadButton(B_B, bLabel, Color.parseColor("#2F7FBF"),
-            Color.parseColor("#6DB6F2"), 999, abSp);
-        rowB.addView(btnB, new LinearLayout.LayoutParams(dp(84), dp(84)));
+            Color.parseColor("#6DB6F2"), 999, Math.max(10.5f, abSp * pg.scale));
+        rowB.addView(btnB, new LinearLayout.LayoutParams(pg.ab, pg.ab));
         LinearLayout.LayoutParams rb = new LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        rb.topMargin = dp(6);
+        rb.topMargin = pg.abGap;
         ab.addView(rowB, rb);
         padRow.addView(ab);
         return padRow;
@@ -2261,7 +2322,7 @@ public class MainActivity extends Activity {
                 c.addView(centerText("Bạn bắn trước hiệu lệnh — bị khoá và −100 điểm vòng này. Đợi vòng sau nhé.", 16, C_TEXT, false), matchWrap(6));
             } else {
                 Button b = bigButton("ĐỢI…\nNghe hiệu lệnh BẮN!", C_RED, 0xFFFF8A8A, 28);
-                LinearLayout.LayoutParams p = lp(dp(270), dp(270), 26);
+                LinearLayout.LayoutParams p = lp(dp(fitSquareDp(270)), dp(fitSquareDp(270)), 26);
                 p.gravity = Gravity.CENTER_HORIZONTAL;
                 c.addView(b, p);
                 fireOnDown(b, new Runnable() {
@@ -2277,7 +2338,7 @@ public class MainActivity extends Activity {
                 c.addView(centerText("ĐÃ BẮN! Đợi kết quả…", 28, C_TEXT, true), matchWrap(40));
             } else {
                 Button b = bigButton("BẮN!", Color.parseColor("#1FA855"), C_GREEN, 36);
-                LinearLayout.LayoutParams p = lp(dp(270), dp(270), 26);
+                LinearLayout.LayoutParams p = lp(dp(fitSquareDp(270)), dp(fitSquareDp(270)), 26);
                 p.gravity = Gravity.CENTER_HORIZONTAL;
                 c.addView(b, p);
                 fireOnDown(b, new Runnable() {
