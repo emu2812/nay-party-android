@@ -4,7 +4,10 @@ import android.app.Activity;
 import android.content.Context;
 import android.content.SharedPreferences;
 import android.content.res.Configuration;
+import android.graphics.Canvas;
 import android.graphics.Color;
+import android.graphics.Paint;
+import android.graphics.RectF;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
 import android.os.Bundle;
@@ -104,8 +107,8 @@ public class MainActivity extends Activity {
         Color.parseColor("#FFC93D"), Color.parseColor("#F77FB0") };
 
     // pad bit indexes
-    private static final int B_U = 0, B_D = 1, B_L = 2, B_R = 3, B_A = 4, B_B = 5;
-    private static final String[] PAD_KEYS = { "u", "d", "l", "r", "a", "b" };
+    private static final int B_U = 0, B_D = 1, B_L = 2, B_R = 3, B_A = 4, B_B = 5, B_X = 6, B_Y = 7;
+    private static final String[] PAD_KEYS = { "u", "d", "l", "r", "a", "b", "x", "y" };
 
     // ---- session ----
     private SharedPreferences prefs;
@@ -187,7 +190,7 @@ public class MainActivity extends Activity {
     private Boolean prevMyAlive = null;
 
     // gamepad state
-    private final boolean[] padState = new boolean[6];
+    private final boolean[] padState = new boolean[8];
 
     // ======================= lifecycle =======================
 
@@ -786,7 +789,7 @@ public class MainActivity extends Activity {
     private JSONObject padJson() {
         JSONObject p = new JSONObject();
         try {
-            for (int i = 0; i < 6; i++) p.put(PAD_KEYS[i], padState[i]);
+            for (int i = 0; i < padState.length; i++) p.put(PAD_KEYS[i], padState[i]);
         } catch (Exception ignored) { }
         return p;
     }
@@ -798,7 +801,7 @@ public class MainActivity extends Activity {
 
     private void clearPad(boolean send) {
         boolean any = false;
-        for (int i = 0; i < 6; i++) { if (padState[i]) { padState[i] = false; any = true; } }
+        for (int i = 0; i < padState.length; i++) { if (padState[i]) { padState[i] = false; any = true; } }
         if (any && send && inRoom) sendPadSnapshot(padJson());
     }
 
@@ -808,7 +811,7 @@ public class MainActivity extends Activity {
         final JSONObject on = new JSONObject();
         final JSONObject off = new JSONObject();
         try {
-            for (int i = 0; i < 6; i++) { on.put(PAD_KEYS[i], i == B_B); off.put(PAD_KEYS[i], false); }
+            for (int i = 0; i < PAD_KEYS.length; i++) { on.put(PAD_KEYS[i], i == B_B); off.put(PAD_KEYS[i], false); }
         } catch (Exception ignored) { }
         if (wsOpen) {
             // Same press, as two frames: the single ordered wsExec queue
@@ -2553,6 +2556,171 @@ public class MainActivity extends Activity {
         }
     }
 
+    // ---------- circular direction disc (replaces the 3x3 D-pad grid) ----
+    /**
+     * A round direction disc: the thumb presses once and SLIDES across
+     * four segments instead of hunting four separate square buttons.
+     * Direction bits are computed from the thumb's offset from the disc
+     * centre: dead zone inside 0.18R, axis thresholds at +/-0.25R, and
+     * both axes may engage at once, so a diagonal slide gives a natural
+     * 8-way input. Bits are written to padState through the exact same
+     * pathway as PadButton (padState + onPadChanged), so snapshots,
+     * latest-wins coalescing, WS frames and clearPad behave identically.
+     * The lit segments are drawn FROM padState — the single source of
+     * truth — so a clearPad() issued anywhere (screen rebuild, onPause)
+     * also unlights the disc on its next draw.
+     */
+    private class DiscPad extends View {
+        private final HashSet<String> dim;
+        private int activePointer = -1;
+        private final Paint fillPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint segPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint ringPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint linePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint hubPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint arrowPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final RectF segOval = new RectF();
+
+        DiscPad(HashSet<String> dimDirs) {
+            super(MainActivity.this);
+            this.dim = dimDirs;
+            setFocusable(false);
+            ringPaint.setStyle(Paint.Style.STROKE);
+            ringPaint.setColor(Color.parseColor("#6DB6F2"));
+            linePaint.setStyle(Paint.Style.STROKE);
+            linePaint.setColor(Color.parseColor("#17122B"));
+            arrowPaint.setTypeface(Typeface.DEFAULT_BOLD);
+            arrowPaint.setTextAlign(Paint.Align.CENTER);
+        }
+
+        @Override
+        protected void onDraw(Canvas canvas) {
+            super.onDraw(canvas);
+            float w = getWidth(), h = getHeight();
+            if (w <= 0 || h <= 0) return;
+            float cx = w / 2f, cy = h / 2f;
+            float r = Math.min(w, h) / 2f;
+            float rimW = Math.max(2f, dp(3));
+            // Base disc.
+            fillPaint.setColor(C_PANEL2);
+            canvas.drawCircle(cx, cy, r - rimW / 2f, fillPaint);
+            // Lit segments: pie slices under the hub (drawn after, it
+            // covers their centres). Angles: 0 deg = 3 o'clock, positive
+            // clockwise (y grows downward).
+            float sr = r - rimW;
+            segOval.set(cx - sr, cy - sr, cx + sr, cy + sr);
+            segPaint.setColor(Color.parseColor("#6DB6F2"));
+            if (padState[B_R]) canvas.drawArc(segOval, -45, 90, true, segPaint);
+            if (padState[B_D]) canvas.drawArc(segOval, 45, 90, true, segPaint);
+            if (padState[B_L]) canvas.drawArc(segOval, 135, 90, true, segPaint);
+            if (padState[B_U]) canvas.drawArc(segOval, 225, 90, true, segPaint);
+            // Separators along the diagonals, hub edge to rim.
+            float hubR = r * 0.30f;
+            linePaint.setStrokeWidth(Math.max(1.5f, dp(2)));
+            for (int i = 0; i < 4; i++) {
+                double ang = Math.PI / 4 + i * Math.PI / 2;
+                canvas.drawLine(
+                    cx + (float) Math.cos(ang) * hubR, cy + (float) Math.sin(ang) * hubR,
+                    cx + (float) Math.cos(ang) * sr, cy + (float) Math.sin(ang) * sr, linePaint);
+            }
+            // Centre hub + its ring.
+            hubPaint.setColor(C_PANEL);
+            canvas.drawCircle(cx, cy, hubR, hubPaint);
+            ringPaint.setStrokeWidth(Math.max(1.5f, dp(1.5f)));
+            canvas.drawCircle(cx, cy, hubR, ringPaint);
+            // Coloured outer rim.
+            ringPaint.setStrokeWidth(rimW);
+            canvas.drawCircle(cx, cy, r - rimW / 2f, ringPaint);
+            // Pole arrows.
+            float aDist = r * 0.68f;
+            arrowPaint.setTextSize(Math.min(w, h) * 0.15f);
+            Paint.FontMetrics fm = arrowPaint.getFontMetrics();
+            float baseOff = -(fm.ascent + fm.descent) / 2f;
+            drawArrow(canvas, "▲", cx, cy - aDist + baseOff, B_U, "u");
+            drawArrow(canvas, "▼", cx, cy + aDist + baseOff, B_D, "d");
+            drawArrow(canvas, "◀", cx - aDist, cy + baseOff, B_L, "l");
+            drawArrow(canvas, "▶", cx + aDist, cy + baseOff, B_R, "r");
+        }
+
+        private void drawArrow(Canvas canvas, String glyph, float x, float y, int bit, String key) {
+            int alpha = 235;
+            if (dim != null && dim.contains(key)) alpha = 90; // not mine: dim like the old buttons
+            arrowPaint.setColor(padState[bit] ? Color.WHITE : Color.parseColor("#D9D4F5"));
+            arrowPaint.setAlpha(alpha);
+            canvas.drawText(glyph, x, y, arrowPaint);
+        }
+
+        @Override
+        public boolean onTouchEvent(MotionEvent ev) {
+            int a = ev.getActionMasked();
+            if (a == MotionEvent.ACTION_DOWN || a == MotionEvent.ACTION_POINTER_DOWN) {
+                if (activePointer < 0) {
+                    if (getParent() != null) getParent().requestDisallowInterceptTouchEvent(true);
+                    activePointer = ev.getPointerId(ev.getActionIndex());
+                    applyTouch(ev, ev.getActionIndex());
+                }
+                return true;
+            }
+            if (a == MotionEvent.ACTION_MOVE) {
+                if (activePointer >= 0) {
+                    int idx = ev.findPointerIndex(activePointer);
+                    if (idx >= 0) applyTouch(ev, idx);
+                }
+                return true;
+            }
+            if (a == MotionEvent.ACTION_POINTER_UP) {
+                if (ev.getPointerId(ev.getActionIndex()) == activePointer) {
+                    activePointer = -1;
+                    setDirs(false, false, false, false);
+                }
+                return true;
+            }
+            if (a == MotionEvent.ACTION_UP || a == MotionEvent.ACTION_CANCEL) {
+                activePointer = -1;
+                setDirs(false, false, false, false);
+                return true;
+            }
+            return true;
+        }
+
+        private void applyTouch(MotionEvent ev, int idx) {
+            float w = getWidth(), h = getHeight();
+            if (w <= 0 || h <= 0) return;
+            float r = Math.min(w, h) / 2f;
+            float dx = ev.getX(idx) - w / 2f;
+            float dy = ev.getY(idx) - h / 2f;
+            double dist = Math.hypot(dx, dy);
+            boolean u = false, d = false, l = false, rr = false;
+            if (dist >= 0.18 * r && dist <= 1.3 * r) {
+                float th = 0.25f * r;
+                rr = dx > th;
+                l = dx < -th;
+                d = dy > th;
+                u = dy < -th;
+            }
+            setDirs(u, d, l, rr);
+        }
+
+        /** Same write path as PadButton.syncBit: padState, then onPadChanged. */
+        private void setDirs(boolean u, boolean d, boolean l, boolean r) {
+            if (padState[B_U] == u && padState[B_D] == d
+                && padState[B_L] == l && padState[B_R] == r) return;
+            padState[B_U] = u;
+            padState[B_D] = d;
+            padState[B_L] = l;
+            padState[B_R] = r;
+            onPadChanged();
+            invalidate();
+        }
+
+        @Override
+        protected void onDetachedFromWindow() {
+            activePointer = -1;
+            setDirs(false, false, false, false);
+            super.onDetachedFromWindow();
+        }
+    }
+
     private LinearLayout arenaPad(JSONObject v, JSONObject g) {
         clearPad(true); // a rebuilt screen must never inherit a stuck "held" bit
         LinearLayout c = col();
@@ -2622,8 +2790,15 @@ public class MainActivity extends Activity {
     // cell 73, A/B 91, whole stack 327 <= 360 with no scrolling.
     // The built width never exceeds the stage: nothing can overflow
     // the screen edge in either orientation (the v1.3 guarantee).
+    // v1.7: the 3x3 button grid became a circular DiscPad whose
+    // diameter is exactly 3 cells (220dp at the 360dp reference) —
+    // inside the same envelope (the grid's 2x4dp of gaps is now spare
+    // slack). Games with 3-4 action buttons use the tighter diamond
+    // geometry of computeDiaGeom() instead (disc ~188dp, buttons
+    // 66dp at the 360dp reference).
     private static class PadGeom {
         int cell;       // D-pad button size (px)
+        int disc;       // direction disc diameter (px) = 3 cells, no gaps
         int cellGap;    // gap between D-pad cells (px)
         int midGap;     // fixed D-pad <-> A/B gap (px; unused when flexGap)
         boolean flexGap;
@@ -2670,10 +2845,68 @@ public class MainActivity extends Activity {
         if (cellF < 40f) cellF = 40f;
         float abF = cellF * 1.25f;
         g.cell = dp(cellF);
+        g.disc = dp(cellF * 3f);
         g.ab = dp(abF);
         if (g.spacer < 0) g.spacer = dp(abF * 0.3f);
         g.dirSp = Math.max(20f, Math.min(34f, cellF * 0.45f));
         g.abSp = Math.max(14f, Math.min(20f, abF * 0.2f));
+        return g;
+    }
+
+    // ---- diamond geometry (games with 3-4 action buttons) ----------
+    // The ABXY diamond is taller and narrower than the roomy A/B
+    // column: Y over the middle, X and A flanking, B under the middle,
+    // so its footprint is (2*btn + 2) wide and (3*btn + 8) tall.
+    // Solved from the same stage budget (availW = wDp - 32): buttons
+    // are sized first (60-68dp), the disc takes what remains.
+    // Reference points (dp): 360x640 portrait -> btn 66, diamond
+    // 134 wide x 206 tall, disc 188, cluster 188+6+134 = 328 = stage;
+    // 320x480 portrait -> btn 60, diamond 122x188, disc 160, cluster
+    // 288 = stage; 640x360 landscape -> btn 68, disc capped by the
+    // height budget at 240, middle gap flexes, stack <= 340 <= 360.
+    private static class DiaGeom {
+        int disc;       // disc diameter (px)
+        int btn;        // diamond button size (px)
+        int w;          // diamond footprint width (px)
+        int h;          // diamond footprint height (px)
+        int midGap;     // fixed disc <-> diamond gap (px; unused when flexGap)
+        boolean flexGap;
+        float btnSp;    // diamond button label size (sp)
+    }
+
+    private DiaGeom computeDiaGeom() {
+        DisplayMetrics dm = getResources().getDisplayMetrics();
+        float wDp = dm.widthPixels / dm.density;
+        float hDp = dm.heightPixels / dm.density;
+        boolean land = wDp > hDp;
+        float availW = wDp - 32f;
+        // Vertical room for the cluster: same line budgets as
+        // computePadGeom (36dp root+panel; 94dp of lines in portrait,
+        // 64dp in landscape, +20dp safety there).
+        float hBudget = land ? (hDp - 36f - 64f - 20f) : (hDp - 36f - 94f);
+        float dbF = Math.min(68f, Math.max(60f, availW * 0.20f));
+        if (3f * dbF + 8f > hBudget) { // unusually short screen: shrink buttons first
+            dbF = Math.max(44f, (hBudget - 8f) / 3f);
+        }
+        float diaW = 2f * dbF + 2f;
+        float diaH = 3f * dbF + 8f;
+        float discF = availW - 6f - diaW;
+        if (discF > hBudget) discF = hBudget; // landscape: height binds, gap flexes
+        if (discF < 100f) { // very narrow screen: trade button size for disc size
+            float cut = 100f - discF;
+            dbF = Math.max(44f, dbF - cut / 2f);
+            diaW = 2f * dbF + 2f;
+            diaH = 3f * dbF + 8f;
+            discF = availW - 6f - diaW;
+        }
+        DiaGeom g = new DiaGeom();
+        g.btn = dp(dbF);
+        g.w = dp(diaW);
+        g.h = dp(diaH);
+        g.disc = dp(discF);
+        g.midGap = dp(6);
+        g.flexGap = land;
+        g.btnSp = Math.max(11f, Math.min(14f, dbF * 0.19f));
         return g;
     }
 
@@ -2719,83 +2952,125 @@ public class MainActivity extends Activity {
     }
 
     /**
-     * Shared D-pad + A/B cluster for the newer games (same geometry as the
-     * day-ra/ne-dan pad). dimDirs holds direction keys ("u","d","l","r")
-     * to render dimmed — used by Chung Một Thân, where only the directions
-     * a player owns are live (the server filters the rest anyway).
-     * Geometry is adaptive (see computePadGeom): it always fits the stage.
+     * Shared controller cluster: the circular direction disc on the
+     * left, the game's action buttons on the right. Which action
+     * buttons exist is per game — a null label HIDES that button.
+     * Games with 1-2 action buttons get the roomy staggered column
+     * (computePadGeom, unchanged since v1.4); games with 3-4 get the
+     * classic gamepad diamond — Y top, X left, A right, B bottom —
+     * on the tighter computeDiaGeom budget. dimDirs holds direction
+     * keys ("u","d","l","r") to draw dimmed on the disc — used by
+     * Chung Một Thân, where only the directions a player owns are
+     * live (the server filters the rest anyway).
      */
     private LinearLayout padCluster(String aLabel, String bLabel, float abSp, HashSet<String> dimDirs) {
-        PadGeom pg = computePadGeom();
+        return padCluster(aLabel, bLabel, null, null, abSp, dimDirs);
+    }
+
+    private LinearLayout padCluster(String aLabel, String bLabel, String xLabel, String yLabel,
+                                    float abSp, HashSet<String> dimDirs) {
+        // The per-game action-button spec, in slot order A, B, X, Y.
+        int[] specBit = { B_A, B_B, B_X, B_Y };
+        String[] specLabel = { aLabel, bLabel, xLabel, yLabel };
+        int[] specBase = { Color.parseColor("#B03030"), Color.parseColor("#2F7FBF"),
+            Color.parseColor("#1E7A46"), Color.parseColor("#9A6B0F") };
+        int[] specGlow = { Color.parseColor("#FF6B6B"), Color.parseColor("#6DB6F2"),
+            Color.parseColor("#58D68D"), Color.parseColor("#FFC93D") };
+        int n = 0;
+        for (int i = 0; i < 4; i++) if (specLabel[i] != null) n++;
+        int[] vBit = new int[n];
+        String[] vLabel = new String[n];
+        int[] vBase = new int[n];
+        int[] vGlow = new int[n];
+        int k = 0;
+        for (int i = 0; i < 4; i++) {
+            if (specLabel[i] == null) continue;
+            vBit[k] = specBit[i];
+            vLabel[k] = specLabel[i];
+            vBase[k] = specBase[i];
+            vGlow[k] = specGlow[i];
+            k++;
+        }
+
         LinearLayout padRow = new LinearLayout(this);
         padRow.setOrientation(LinearLayout.HORIZONTAL);
         padRow.setGravity(Gravity.CENTER);
-
-        LinearLayout dpad = col();
-        int DB = pg.cell;
-        int[][] bits = {
-            { -1, B_U, -1 },
-            { B_L, -1, B_R },
-            { -1, B_D, -1 } };
-        String[][] keys = {
-            { "", "u", "" },
-            { "l", "", "r" },
-            { "", "d", "" } };
-        String[][] labels = {
-            { "", "▲", "" },
-            { "◀", "", "▶" },
-            { "", "▼", "" } };
-        for (int r = 0; r < 3; r++) {
-            LinearLayout rowL = new LinearLayout(this);
-            rowL.setOrientation(LinearLayout.HORIZONTAL);
-            for (int k = 0; k < 3; k++) {
-                if (bits[r][k] < 0) {
-                    View empty = new View(this);
-                    rowL.addView(empty, new LinearLayout.LayoutParams(DB, DB));
-                } else {
-                    PadButton b = new PadButton(bits[r][k], labels[r][k],
-                        C_PANEL2, Color.parseColor("#6DB6F2"), 16, pg.dirSp);
-                    if (dimDirs != null && dimDirs.contains(keys[r][k])) b.setAlpha(0.35f);
-                    LinearLayout.LayoutParams bp = new LinearLayout.LayoutParams(DB, DB);
-                    if (k > 0) bp.leftMargin = pg.cellGap;
-                    rowL.addView(b, bp);
-                }
+        DiscPad disc = new DiscPad(dimDirs);
+        if (n >= 3) {
+            DiaGeom dg = computeDiaGeom();
+            padRow.addView(disc, new LinearLayout.LayoutParams(dg.disc, dg.disc));
+            View gap = new View(this);
+            if (dg.flexGap) {
+                // Landscape grip: disc left, diamond right, space flexes.
+                padRow.addView(gap, new LinearLayout.LayoutParams(0, 1, 1f));
+            } else {
+                padRow.addView(gap, new LinearLayout.LayoutParams(dg.midGap, 1));
             }
-            LinearLayout.LayoutParams rp = new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-            if (r > 0) rp.topMargin = pg.cellGap;
-            dpad.addView(rowL, rp);
+            padRow.addView(buildDiamond(dg, vBit, vLabel, vBase, vGlow),
+                new LinearLayout.LayoutParams(dg.w, dg.h));
+            return padRow;
         }
-        padRow.addView(dpad);
+        PadGeom pg = computePadGeom();
+        padRow.addView(disc, new LinearLayout.LayoutParams(pg.disc, pg.disc));
 
         View gap = new View(this);
         if (pg.flexGap) {
-            // Landscape grip: D-pad left, A/B right, space flexes between.
+            // Landscape grip: disc left, buttons right, space flexes between.
             padRow.addView(gap, new LinearLayout.LayoutParams(0, 1, 1f));
         } else {
             padRow.addView(gap, new LinearLayout.LayoutParams(pg.midGap, 1));
         }
+        if (n > 0) padRow.addView(buildAbColumn(pg, vBit, vLabel, vBase, vGlow, abSp));
+        return padRow;
+    }
 
+    /** The roomy 1-2 button column: first button top (staggered in
+     *  landscape), second button bottom — the v1.4 arrangement. */
+    private LinearLayout buildAbColumn(PadGeom pg, int[] bits, String[] labels,
+                                       int[] bases, int[] glows, float abSp) {
         LinearLayout ab = col();
         LinearLayout rowA = new LinearLayout(this);
         rowA.setOrientation(LinearLayout.HORIZONTAL);
         View spA = new View(this);
         rowA.addView(spA, new LinearLayout.LayoutParams(pg.spacer, 1));
-        PadButton btnA = new PadButton(B_A, aLabel, Color.parseColor("#B03030"),
-            Color.parseColor("#FF6B6B"), 999, Math.max(abSp, pg.abSp));
-        rowA.addView(btnA, new LinearLayout.LayoutParams(pg.ab, pg.ab));
+        PadButton top = new PadButton(bits[0], labels[0], bases[0], glows[0], 999,
+            Math.max(abSp, pg.abSp));
+        rowA.addView(top, new LinearLayout.LayoutParams(pg.ab, pg.ab));
         ab.addView(rowA);
-        LinearLayout rowB = new LinearLayout(this);
-        rowB.setOrientation(LinearLayout.HORIZONTAL);
-        PadButton btnB = new PadButton(B_B, bLabel, Color.parseColor("#2F7FBF"),
-            Color.parseColor("#6DB6F2"), 999, Math.max(abSp, pg.abSp));
-        rowB.addView(btnB, new LinearLayout.LayoutParams(pg.ab, pg.ab));
-        LinearLayout.LayoutParams rb = new LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        rb.topMargin = pg.abGap;
-        ab.addView(rowB, rb);
-        padRow.addView(ab);
-        return padRow;
+        if (bits.length > 1) {
+            LinearLayout rowB = new LinearLayout(this);
+            rowB.setOrientation(LinearLayout.HORIZONTAL);
+            PadButton bot = new PadButton(bits[1], labels[1], bases[1], glows[1], 999,
+                Math.max(abSp, pg.abSp));
+            rowB.addView(bot, new LinearLayout.LayoutParams(pg.ab, pg.ab));
+            LinearLayout.LayoutParams rb = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            rb.topMargin = pg.abGap;
+            ab.addView(rowB, rb);
+        }
+        return ab;
+    }
+
+    /** The classic gamepad diamond inside a (2*btn+2) x (3*btn+8)
+     *  footprint: Y top-centre, X middle-left, A middle-right, B
+     *  bottom-centre. Buttons a game doesn't use are simply absent. */
+    private FrameLayout buildDiamond(DiaGeom dg, int[] bits, String[] labels,
+                                     int[] bases, int[] glows) {
+        FrameLayout dia = new FrameLayout(this);
+        for (int i = 0; i < bits.length; i++) {
+            int cxPx, cyPx;
+            if (bits[i] == B_Y) { cxPx = dg.w / 2; cyPx = dg.btn / 2; }
+            else if (bits[i] == B_X) { cxPx = dg.btn / 2; cyPx = dg.h / 2; }
+            else if (bits[i] == B_A) { cxPx = dg.w - dg.btn / 2; cyPx = dg.h / 2; }
+            else { cxPx = dg.w / 2; cyPx = dg.h - dg.btn / 2; } // B_B
+            PadButton b = new PadButton(bits[i], labels[i], bases[i], glows[i], 999, dg.btnSp);
+            FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(dg.btn, dg.btn);
+            lp.gravity = Gravity.LEFT | Gravity.TOP;
+            lp.leftMargin = cxPx - dg.btn / 2;
+            lp.topMargin = cyPx - dg.btn / 2;
+            dia.addView(b, lp);
+        }
+        return dia;
     }
 
     // ---------- Cướp Sao / Giữ Vương Miện / Sơn Sàn (versus arena pads) ----------
@@ -2976,14 +3251,15 @@ public class MainActivity extends Activity {
         addFlex(c);
         LinearLayout.LayoutParams pr = matchWrap(4);
         pr.gravity = Gravity.CENTER_HORIZONTAL;
-        c.addView(padCluster("A\nĐÁNH", "B\nLƯỚT", 17, null), pr);
-        addHint(c, "A ĐÁNH · B LƯỚT · % càng cao càng dễ bị đánh văng");
+        c.addView(padCluster("A\nĐÁNH", "B\nLƯỚT", "X\nĐÁNH MẠNH", "Y\nNHẢY", 17, null), pr);
+        addHint(c, "A ĐÁNH · X ĐÁNH MẠNH · B LƯỚT · Y NHẢY · % càng cao càng dễ bị đánh văng");
         c.addView(timerLine("sec"), matchWrap(2));
         return c;
     }
 
     // ---------- Đền Lửa & Nước (co-op: element platformer) ----------
-    // ←/→ run, ↑ or A jumps; B has no effect here. Your element is dealt
+    // ←/→ run, ↑, A or Y jumps; B and X don't exist in this game, so
+    // they are hidden rather than shown dead. Your element is dealt
     // once for the whole match, so it sits in a coloured chip inside the
     // screen (play screens stay header-less); team hearts + gem counts
     // refresh in place via tvTempleLine.
@@ -3011,7 +3287,7 @@ public class MainActivity extends Activity {
         addFlex(c);
         LinearLayout.LayoutParams pr = matchWrap(4);
         pr.gravity = Gravity.CENTER_HORIZONTAL;
-        c.addView(padCluster("A\nNHẢY", "B", 17, null), pr);
+        c.addView(padCluster("A\nNHẢY", null, null, "Y\nNHẢY", 17, null), pr);
         addHint(c, fire
             ? "Nhặt ngọc lửa 🔥 · Tránh xa hồ nước!"
             : "Nhặt ngọc nước 💧 · Tránh xa hồ lửa!");
