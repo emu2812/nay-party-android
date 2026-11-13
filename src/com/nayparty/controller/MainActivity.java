@@ -162,6 +162,8 @@ public class MainActivity extends Activity {
     private TextView tvMineValue;       // cuop-sao banked / crown hold / splat cells / box deliveries / shared checks
     private TextView tvHearts;          // chung-mot-than team hearts
     private TextView tvDefendLine;      // thu-thanh crystal HP + team kills (updated in place)
+    private TextView tvDmg;             // nguoi-que my damage % (updated in place)
+    private TextView tvTempleLine;      // den-lua-nuoc gems + team hearts (updated in place)
     private TextView tvCrownLine;       // giu-vuong-mien holder banner (updated in place, no rebuild)
     // cheo-thuyen fast-ticker refs (beat flash runs off server-synced time)
     private Button rowBtn;
@@ -1338,9 +1340,10 @@ public class MainActivity extends Activity {
             } else if (gid.equals("day-hop") || gid.equals("cheo-thuyen")) {
                 // Steady screens: deliveries / beat stats update in place
                 // (cheo-thuyen also has its own 50ms beat ticker).
-            } else if (gid.equals("xe-tank") || gid.equals("dat-bom")) {
+            } else if (gid.equals("xe-tank") || gid.equals("dat-bom") || gid.equals("nguoi-que")) {
                 // Same deal as day-ra/ne-dan: rebuild only when my alive
-                // status flips; lives refresh in place via tvLives.
+                // status flips; lives refresh in place via tvLives
+                // (nguoi-que damage % rides along via tvDmg).
                 JSONObject blobs = jObj(g, "blobs");
                 JSONObject my = blobs == null ? null : jObj(blobs, String.valueOf(sSeat));
                 sb.append(':').append(my == null ? "?" : (jBool(my, "alive", true) ? "alive" : "ko"));
@@ -1385,6 +1388,9 @@ public class MainActivity extends Activity {
                         if (st != null) sb.append('|').append(jInt(st, "pos", 0)).append('=').append(jInt(st, "sym", -1));
                     }
                 }
+            } else if (gid.equals("den-lua-nuoc")) {
+                // Steady pad screen: my element is fixed for the whole
+                // match; hearts/gems refresh in place via tvTempleLine.
             }
             return sb.toString();
         }
@@ -1407,10 +1413,19 @@ public class MainActivity extends Activity {
             if (mine >= duaDisplay) duaDisplay = mine;
             tvMyCount.setText(String.valueOf(Math.max(duaDisplay, 0)));
         }
-        if ((gid.equals("day-ra") || gid.equals("ne-dan") || gid.equals("xe-tank") || gid.equals("dat-bom")) && tvLives != null) {
+        if ((gid.equals("day-ra") || gid.equals("ne-dan") || gid.equals("xe-tank") || gid.equals("dat-bom")
+                || gid.equals("nguoi-que")) && tvLives != null) {
             JSONObject blobs = jObj(g, "blobs");
             JSONObject my = blobs == null ? null : jObj(blobs, String.valueOf(sSeat));
             if (my != null) tvLives.setText(hearts(jInt(my, "lives", 0)));
+        }
+        if (gid.equals("nguoi-que") && tvDmg != null) {
+            int dmg = myDmgOf(g);
+            tvDmg.setText(dmg + "%");
+            tvDmg.setTextColor(dmgColor(dmg));
+        }
+        if (gid.equals("den-lua-nuoc") && tvTempleLine != null) {
+            tvTempleLine.setText(templeLineText(g));
         }
         if (gid.equals("thu-thanh") && tvDefendLine != null) {
             JSONObject crystal = jObj(g, "crystal");
@@ -1473,6 +1488,30 @@ public class MainActivity extends Activity {
         return sb.toString();
     }
 
+    /** My Người Que damage %: per-blob value first, myDmg as fallback. */
+    private int myDmgOf(JSONObject g) {
+        JSONObject blobs = jObj(g, "blobs");
+        JSONObject my = blobs == null ? null : jObj(blobs, String.valueOf(sSeat));
+        return jInt(my, "dmg", jInt(g, "myDmg", 0));
+    }
+
+    /** Damage colour: the higher the %, the farther you fly when hit. */
+    private int dmgColor(int dmg) {
+        if (dmg >= 100) return C_RED;
+        if (dmg >= 50) return Color.parseColor("#FFC93D");
+        return C_TEXT;
+    }
+
+    /** Đền Lửa & Nước status line: gems per element + team hearts,
+     *  mirroring the web phone's score chips. */
+    private String templeLineText(JSONObject g) {
+        JSONObject gc = jObj(g, "gemCount");
+        int per = Math.max(1, jInt(g, "gemsTotal", 10) / 2);
+        return "🔥 " + (gc == null ? 0 : jInt(gc, "lua", 0)) + "/" + per
+            + " · 💧 " + (gc == null ? 0 : jInt(gc, "nuoc", 0)) + "/" + per
+            + " · Tim đội: " + hearts(jInt(g, "hearts", 0));
+    }
+
     // ======================= vibrations (mirror the web controller) =======================
 
     private void checkVibrations(JSONObject v) {
@@ -1490,8 +1529,10 @@ public class MainActivity extends Activity {
                     if (!key.equals(lastVibKey)) { lastVibKey = key; vibrate(90); }
                 }
             }
-            if ((gid.equals("day-ra") || gid.equals("ne-dan") || gid.equals("xe-tank") || gid.equals("dat-bom"))
-                    && (gp.equals("arena") || gp.equals("dodge") || gp.equals("tank") || gp.equals("bomber"))) {
+            if ((gid.equals("day-ra") || gid.equals("ne-dan") || gid.equals("xe-tank") || gid.equals("dat-bom")
+                    || gid.equals("nguoi-que"))
+                    && (gp.equals("arena") || gp.equals("dodge") || gp.equals("tank") || gp.equals("bomber")
+                    || gp.equals("fight"))) {
                 JSONObject blobs = jObj(g, "blobs");
                 JSONObject my = blobs == null ? null : jObj(blobs, String.valueOf(sSeat));
                 if (my != null) {
@@ -2036,6 +2077,8 @@ public class MainActivity extends Activity {
         if (gid.equals("ke-gia-mao")) return new int[] { 0xFF1E0A38, 0xFF0C0516 };
         if (gid.equals("thu-thanh")) return new int[] { 0xFF06222E, 0xFF02101A };
         if (gid.equals("giai-ma-chung")) return new int[] { 0xFF191238, 0xFF08061A };
+        if (gid.equals("nguoi-que")) return new int[] { 0xFF2A0A16, 0xFF0D0309 };
+        if (gid.equals("den-lua-nuoc")) return new int[] { 0xFF241305, 0xFF0A0501 };
         return new int[] { C_PANEL, C_BG };
     }
 
@@ -2098,6 +2141,8 @@ public class MainActivity extends Activity {
         else if (gid.equals("xe-tank") || gid.equals("dat-bom") || gid.equals("thu-thanh")) inner = gunPad(v, g);
         else if (gid.equals("ke-gia-mao")) inner = keGiaMao(v, g);
         else if (gid.equals("giai-ma-chung")) inner = giaiMaChung(v, g);
+        else if (gid.equals("nguoi-que")) inner = fightPad(v, g);
+        else if (gid.equals("den-lua-nuoc")) inner = templePad(v, g);
         else {
             inner = col();
             inner.addView(centerText("Đang chơi: " + jStr(g, "name", ""), 18, C_TEXT, true));
@@ -2885,6 +2930,91 @@ public class MainActivity extends Activity {
         pr.gravity = Gravity.CENTER_HORIZONTAL;
         c.addView(padCluster(aLabel, "B\nLướt", abSp, null), pr);
         addHint(c, hint);
+        c.addView(timerLine("sec"), matchWrap(2));
+        return c;
+    }
+
+    // ---------- Người Que Đại Chiến (versus: platform fighter) ----------
+    // Smash rules on the standard pad: ←/→ run, ↑ double-jumps, A attacks,
+    // B dashes. Damage % is the knockback meter — the higher it climbs,
+    // the farther a hit sends you. Lives + % refresh in place (tvLives /
+    // tvDmg); the signature only flips alive/ko, like xe-tank.
+    private LinearLayout fightPad(JSONObject v, JSONObject g) {
+        clearPad(true); // a rebuilt screen must never inherit a stuck "held" bit
+        LinearLayout c = col();
+        c.setGravity(Gravity.CENTER_HORIZONTAL);
+        if (!jStr(g, "phase", "").equals("fight")) {
+            c.addView(centerText("Đợi vào sân…", 18, C_MUTED, false), matchWrap(30));
+            return c;
+        }
+        JSONObject blobs = jObj(g, "blobs");
+        JSONObject my = blobs == null ? null : jObj(blobs, String.valueOf(sSeat));
+        if (my == null) {
+            c.addView(centerText("Đang vào sân…", 18, C_MUTED, false), matchWrap(30));
+            return c;
+        }
+        if (!jBool(my, "alive", true)) {
+            TextView ko = centerText("K.O.!", 56, C_RED, true);
+            c.addView(ko, matchWrap(18));
+            c.addView(centerText("Người que của bạn đã văng khỏi sàn!", 22, C_TEXT, true), matchWrap(4));
+            c.addView(centerText("Xem TV đợi kết quả nhé…", 15, C_MUTED, false), matchWrap(4));
+            return c;
+        }
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER);
+        row.addView(text("Mạng: ", 17, C_TEXT, true));
+        TextView lv = text(hearts(jInt(my, "lives", 0)), 17, Color.parseColor("#FF8FA3"), true);
+        tvLives = lv;
+        row.addView(lv);
+        row.addView(text("  ·  Sát thương: ", 17, C_TEXT, true));
+        int dmg = myDmgOf(g);
+        TextView dv = text(dmg + "%", 20, dmgColor(dmg), true);
+        tvDmg = dv;
+        row.addView(dv);
+        c.addView(row, matchWrap(6));
+        addFlex(c);
+        LinearLayout.LayoutParams pr = matchWrap(4);
+        pr.gravity = Gravity.CENTER_HORIZONTAL;
+        c.addView(padCluster("A\nĐÁNH", "B\nLƯỚT", 17, null), pr);
+        addHint(c, "A ĐÁNH · B LƯỚT · % càng cao càng dễ bị đánh văng");
+        c.addView(timerLine("sec"), matchWrap(2));
+        return c;
+    }
+
+    // ---------- Đền Lửa & Nước (co-op: element platformer) ----------
+    // ←/→ run, ↑ or A jumps; B has no effect here. Your element is dealt
+    // once for the whole match, so it sits in a coloured chip inside the
+    // screen (play screens stay header-less); team hearts + gem counts
+    // refresh in place via tvTempleLine.
+    private LinearLayout templePad(JSONObject v, JSONObject g) {
+        clearPad(true); // a rebuilt screen must never inherit a stuck "held" bit
+        LinearLayout c = col();
+        c.setGravity(Gravity.CENTER_HORIZONTAL);
+        if (!jStr(g, "phase", "").equals("temple")) {
+            c.addView(centerText("Đợi vào đền…", 18, C_MUTED, false), matchWrap(30));
+            return c;
+        }
+        boolean fire = jStr(g, "myEl", "").equals("lua");
+        TextView chip = centerText(fire ? "🔥 BẠN LÀ LỬA" : "💧 BẠN LÀ NƯỚC", 17, Color.WHITE, true);
+        chip.setBackground(roundRect(fire ? Color.parseColor("#B03030") : Color.parseColor("#2F7FBF"),
+            Color.WHITE, 16));
+        chip.setPadding(dp(16), dp(5), dp(16), dp(5));
+        LinearLayout.LayoutParams cp = new LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        cp.gravity = Gravity.CENTER_HORIZONTAL;
+        cp.topMargin = dp(4);
+        c.addView(chip, cp);
+        TextView line = centerText(templeLineText(g), 17, C_TEXT, true);
+        tvTempleLine = line;
+        c.addView(line, matchWrap(4));
+        addFlex(c);
+        LinearLayout.LayoutParams pr = matchWrap(4);
+        pr.gravity = Gravity.CENTER_HORIZONTAL;
+        c.addView(padCluster("A\nNHẢY", "B", 17, null), pr);
+        addHint(c, fire
+            ? "Nhặt ngọc lửa 🔥 · Tránh xa hồ nước!"
+            : "Nhặt ngọc nước 💧 · Tránh xa hồ lửa!");
         c.addView(timerLine("sec"), matchWrap(2));
         return c;
     }
