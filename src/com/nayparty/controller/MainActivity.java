@@ -12,6 +12,7 @@ import android.os.Handler;
 import android.os.Looper;
 import android.os.Vibrator;
 import android.text.InputType;
+import android.text.TextUtils;
 import android.util.DisplayMetrics;
 import android.util.TypedValue;
 import android.view.Gravity;
@@ -45,6 +46,7 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.zip.GZIPInputStream;
 
 /**
  * Nảy Party — Tay cầm (native Android controller).
@@ -67,6 +69,7 @@ public class MainActivity extends Activity {
     private static final int C_PANEL2 = Color.parseColor("#251D47");
     private static final int C_TEXT = Color.parseColor("#F4F0FF");
     private static final int C_MUTED = Color.parseColor("#A79FD0");
+    private static final int C_HINT = Color.parseColor("#C7CFF0");
     private static final int C_RED = Color.parseColor("#E84F4F");
     private static final int C_GREEN = Color.parseColor("#3ED97E");
     private static final HashMap<String, Integer> SEAT_HEX = new HashMap<String, Integer>();
@@ -402,6 +405,10 @@ public class MainActivity extends Activity {
         c.setReadTimeout(8000);
         c.setRequestMethod(method);
         c.setRequestProperty("Accept", "application/json");
+        // State JSON is highly repetitive; gzip shrinks every poll and
+        // action download several-fold, which is the difference between
+        // a playable and an unplayable controller on weak mobile data.
+        c.setRequestProperty("Accept-Encoding", "gzip");
         if (payload != null) {
             byte[] bytes = payload.toString().getBytes(Charset.forName("UTF-8"));
             c.setDoOutput(true);
@@ -414,6 +421,13 @@ public class MainActivity extends Activity {
         Resp r = new Resp();
         r.status = c.getResponseCode();
         InputStream is = r.status >= 400 ? c.getErrorStream() : c.getInputStream();
+        if (is != null && "gzip".equalsIgnoreCase(c.getContentEncoding())) {
+            // Transparently inflate (success and error bodies alike) so
+            // callers still receive plain text. Reading the gzip stream
+            // to EOF consumes the whole bounded body, so the keep-alive
+            // pool can still reuse the connection afterwards.
+            is = new GZIPInputStream(is);
+        }
         r.body = "";
         if (is != null) {
             // Read the body to EOF and close the stream, but never call
@@ -1233,7 +1247,8 @@ public class MainActivity extends Activity {
         setScreen(col);
     }
 
-    private LinearLayout buildRoom(JSONObject v) {
+    private View buildRoom(JSONObject v) {
+        if (jStr(v, "phase", "").equals("playing")) return buildPlayRoom(v);
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
         root.setBackgroundColor(C_BG);
@@ -1246,6 +1261,41 @@ public class MainActivity extends Activity {
         cp.topMargin = dp(10);
         root.addView(content, cp);
         return root;
+    }
+
+    /**
+     * In-game room: the APK is a pure controller, so while a game is
+     * playing there is NO header/title block at all — the stage owns the
+     * whole screen and every freed dp goes to the controls. The player
+     * is never trapped: a compact "Thoát" chip floats in the top corner
+     * (an overlay, never a layout row, so it costs the buttons nothing).
+     * Gameplay status (lives / time / team line) lives inside the game
+     * screens themselves, exactly as before.
+     */
+    private FrameLayout buildPlayRoom(JSONObject v) {
+        FrameLayout frame = new FrameLayout(this);
+        frame.setBackgroundColor(C_BG);
+        frame.setPadding(dp(8), dp(8), dp(8), dp(8));
+        frame.addView(contentFor(v), new FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+
+        Button chip = new Button(this);
+        chip.setText("Thoát");
+        chip.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+        chip.setTypeface(Typeface.DEFAULT_BOLD);
+        chip.setTextColor(C_TEXT);
+        chip.setAllCaps(false);
+        chip.setBackground(roundRect(Color.parseColor("#CC251D47"), C_MUTED, 12));
+        chip.setPadding(dp(10), 0, dp(10), 0);
+        chip.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View vw) { leaveRoom(null); }
+        });
+        FrameLayout.LayoutParams cp = new FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT, dp(28), Gravity.TOP | Gravity.END);
+        cp.topMargin = dp(2);
+        cp.rightMargin = dp(2);
+        frame.addView(chip, cp);
+        return frame;
     }
 
     private View buildHeader(JSONObject v) {
@@ -1336,6 +1386,20 @@ public class MainActivity extends Activity {
         wrap.setOrientation(LinearLayout.VERTICAL);
         wrap.setBackground(stageBg(top, bottom));
         wrap.setPadding(dp(16), dp(16), dp(16), dp(16));
+        wrap.addView(inner, new LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        return wrap;
+    }
+
+    /** Play-screen stage: tight padding (8 sides / 10 vertical) so the
+     *  controls get the space the old 16dp panel frame used to eat. The
+     *  pad geometry budgets exactly this (32dp horizontal, 36dp
+     *  vertical including the play-room root padding). */
+    private View stagePanel(View inner, int top, int bottom) {
+        LinearLayout wrap = new LinearLayout(this);
+        wrap.setOrientation(LinearLayout.VERTICAL);
+        wrap.setBackground(stageBg(top, bottom));
+        wrap.setPadding(dp(8), dp(10), dp(8), dp(10));
         wrap.addView(inner, new LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
         return wrap;
@@ -1536,7 +1600,7 @@ public class MainActivity extends Activity {
     }
 
     private TextView timerLine(String tag) {
-        TextView t = centerText("", 15, C_MUTED, true);
+        TextView t = centerText("", 16, C_HINT, true);
         t.setTag(tag);
         tvTimer = t;
         return t;
@@ -1559,7 +1623,7 @@ public class MainActivity extends Activity {
             tvTimer = big;
             c.addView(big);
             c.addView(centerText("Chuẩn bị…", 16, C_MUTED, false));
-            return panel(c, sc[0], sc[1]);
+            return stagePanel(c, sc[0], sc[1]);
         }
         LinearLayout inner;
         if (gid.equals("nhanh-tay")) inner = nhanhTay(v, g);
@@ -1582,7 +1646,7 @@ public class MainActivity extends Activity {
             inner = col();
             inner.addView(centerText("Đang chơi: " + jStr(g, "name", ""), 18, C_TEXT, true));
         }
-        return panel(inner, sc[0], sc[1]);
+        return stagePanel(inner, sc[0], sc[1]);
     }
 
     // ---------- Nhanh Tay ----------
@@ -2020,28 +2084,43 @@ public class MainActivity extends Activity {
         livesRow.addView(lv);
         c.addView(livesRow, matchWrap(6));
 
-        // Same adaptive cluster as every other gamepad screen.
-        LinearLayout padRow = padCluster("A\nĐẨY", "B\nLướt", 17, null);
-
-        LinearLayout.LayoutParams pr = matchWrap(16);
+        // Same adaptive cluster as every other gamepad screen,
+        // bottom-anchored under the thumbs.
+        addFlex(c);
+        LinearLayout.LayoutParams pr = matchWrap(4);
         pr.gravity = Gravity.CENTER_HORIZONTAL;
-        c.addView(padRow, pr);
+        c.addView(padCluster("A\nĐẨY", "B\nLướt", 17, null), pr);
 
-        c.addView(centerText(gid.equals("ne-dan")
-            ? "Giữ D-pad để né đạn · B: lướt nhanh"
-            : "Giữ D-pad để di chuyển · A: đẩy đối thủ · B: lướt nhanh", 14, C_MUTED, false), matchWrap(12));
+        addHint(c, gid.equals("ne-dan")
+            ? "A: ĐẨY · B: LƯỚT · Né hết đạn bay tới"
+            : "A: ĐẨY · B: LƯỚT · Đẩy đối thủ rơi sàn");
         return c;
     }
 
     // ---- adaptive gamepad geometry -------------------------------------
-    // The cluster's design size is 342dp wide (D-pad 194 + gap 26 + A/B
-    // column 122) and 194dp tall, but the stage only offers the screen
-    // minus the room root (14dp x2) and stage panel (16dp x2) padding —
-    // on narrow phones and with enlarged display-size settings the fixed
-    // geometry overflowed and the A button was clipped at the right
-    // edge. So the whole cluster scales by the tightest budget; in
-    // landscape the A/B column anchors right with a flexible gap between
-    // the two halves, like holding a real gamepad.
+    // v1.3 scaled a fixed 342dp design down until it fit, which on real
+    // phones shrank the D-pad cells to ~47-54dp (and ~37dp in landscape,
+    // where ~244dp of header/hint chrome ate the height). v1.4 inverts
+    // it: play screens have NO header block and tight 8/10 stage
+    // padding, and the geometry is solved from the actual budgets so
+    // the buttons are as large as the screen allows:
+    //   horizontal: root 8x2 + stage panel 8x2 = 32dp of padding.
+    //   vertical:   root 8x2 + stage panel 10x2 = 36dp, plus at most
+    //               64dp of in-screen lines (status + margins + timer;
+    //               the one-line hint exists only in portrait and is
+    //               budgeted there separately).
+    // Portrait width is the binding constraint: the built cluster is
+    // 3 cells + 2 gaps (4) + middle gap (8) + the A/B column at 1.25x
+    // cell (no stagger spacer in portrait) = 4.25*cell + 16dp, so
+    // cell = (wDp - 32 - 16) / 4.25. Landscape is height-bound:
+    // cell = min(width fit, (height left after lines - 40 chrome) / 3)
+    // with the middle gap flexing and a 0.3*ab stagger, D-pad left /
+    // A/B right like holding a real gamepad.
+    // Reference points (dp): 360x640 portrait -> cell 73, A/B 91;
+    // 320x480 portrait -> cell 64, A/B 80; 640x360 landscape ->
+    // cell 73, A/B 91, whole stack 327 <= 360 with no scrolling.
+    // The built width never exceeds the stage: nothing can overflow
+    // the screen edge in either orientation (the v1.3 guarantee).
     private static class PadGeom {
         int cell;       // D-pad button size (px)
         int cellGap;    // gap between D-pad cells (px)
@@ -2050,7 +2129,8 @@ public class MainActivity extends Activity {
         int spacer;     // A-row indent (px)
         int ab;         // A/B button size (px)
         int abGap;      // vertical gap between the A and B rows (px)
-        float scale;
+        float dirSp;    // D-pad arrow text size (sp)
+        float abSp;     // A/B label text size (sp)
     }
 
     private PadGeom computePadGeom() {
@@ -2058,41 +2138,83 @@ public class MainActivity extends Activity {
         float wDp = dm.widthPixels / dm.density;
         float hDp = dm.heightPixels / dm.density;
         boolean land = wDp > hDp;
-        float availW = wDp - 62f; // root + panel padding + 2dp safety
-        // Height budget: the fixed chrome around the cluster on the
-        // gamepad screens (status bar, root padding, room header, panel
-        // padding, the screen's own status line, cluster margin, hint
-        // and timer lines) totals ~244dp.
-        float sH = (hDp - 244f) / 194f;
-        // Landscape width is plentiful; only a 16dp minimum gap is fixed
-        // and the rest flexes. Portrait must fit the full 342dp design.
-        float sW = land ? (availW - 16f) / 316f : availW / 342f;
-        float s = Math.min(1f, Math.min(sW, sH));
-        if (s < 0.5f) s = 0.5f;
+        float availW = wDp - 32f;
         PadGeom g = new PadGeom();
-        g.scale = s;
-        g.cell = dp(62f * s);
-        g.cellGap = Math.max(dp(2), dp(4f * s));
-        g.midGap = dp(26f * s);
-        g.flexGap = land;
-        g.spacer = dp(38f * s);
-        g.ab = dp(84f * s);
-        g.abGap = Math.max(dp(2), dp(6f * s));
+        g.cellGap = dp(4);
+        g.abGap = dp(6);
+        float cellF;
+        if (!land) {
+            cellF = (availW - 16f) / 4.25f;
+            // Height can only bind on unusually short portrait windows:
+            // lines budget 94 = status 32 + cluster margin 10 + the
+            // single hint line 30 + timer 22.
+            float maxByH = (hDp - 36f - 94f) / 3f;
+            if (cellF > maxByH) cellF = maxByH;
+            g.midGap = dp(8);
+            g.flexGap = false;
+            g.spacer = 0;
+        } else {
+            // Height: after root+panel (36) and the in-screen lines
+            // (64), reserve 40dp of chrome inside the pad area.
+            float byH = (hDp - 36f - 64f - 40f) / 3f;
+            // Width with flexed middle gap (>= 24) and stagger 0.3*ab:
+            // 3c + 2*4 + 24 + 0.375c + 1.25c = 4.625c + 32.
+            float byW = (availW - 32f) / 4.625f;
+            cellF = Math.min(byH, byW);
+            g.flexGap = true;
+            g.midGap = 0;
+            g.spacer = -1; // derived from ab below
+        }
+        if (cellF > 150f) cellF = 150f;
+        if (cellF < 40f) cellF = 40f;
+        float abF = cellF * 1.25f;
+        g.cell = dp(cellF);
+        g.ab = dp(abF);
+        if (g.spacer < 0) g.spacer = dp(abF * 0.3f);
+        g.dirSp = Math.max(20f, Math.min(34f, cellF * 0.45f));
+        g.abSp = Math.max(14f, Math.min(20f, abF * 0.2f));
         return g;
     }
 
     /** Side length (dp) for the full-screen single tap buttons (Nhanh
      *  Tay, Cao Bồi): the design size, capped so the button always fits
      *  the stage — by width first, and in landscape by the height left
-     *  after the ~180dp of fixed chrome around a button-only screen. */
+     *  after the play-screen chrome (~88dp now that play screens have
+     *  no header block: root 16 + stage panel 20 + the button's own
+     *  top margin 26 + safety). At 640x360 the full 270dp design size
+     *  fits again. */
     private int fitSquareDp(float wantDp) {
         DisplayMetrics dm = getResources().getDisplayMetrics();
         float wDp = dm.widthPixels / dm.density;
         float hDp = dm.heightPixels / dm.density;
         float max = wDp - 64f;
-        if (wDp > hDp) max = Math.min(max, hDp - 180f);
+        if (wDp > hDp) max = Math.min(max, hDp - 88f);
         if (max < 110f) max = 110f;
         return (int) Math.min(wantDp, max);
+    }
+
+    private boolean isLandscape() {
+        DisplayMetrics dm = getResources().getDisplayMetrics();
+        return dm.widthPixels > dm.heightPixels;
+    }
+
+    /** Flexible empty space that pushes the pad cluster to the bottom
+     *  of the play screen, where the thumbs actually rest. */
+    private void addFlex(LinearLayout c) {
+        View f = new View(this);
+        c.addView(f, new LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
+    }
+
+    /** The single explanatory line allowed on a pad screen: short,
+     *  single-line, bright (never small grey text). Dropped entirely in
+     *  landscape, where vertical space belongs to the buttons. */
+    private void addHint(LinearLayout c, String s) {
+        if (isLandscape()) return;
+        TextView t = centerText(s, 14, C_HINT, false);
+        t.setSingleLine(true);
+        t.setEllipsize(TextUtils.TruncateAt.END);
+        c.addView(t, matchWrap(10));
     }
 
     /**
@@ -2131,7 +2253,7 @@ public class MainActivity extends Activity {
                     rowL.addView(empty, new LinearLayout.LayoutParams(DB, DB));
                 } else {
                     PadButton b = new PadButton(bits[r][k], labels[r][k],
-                        C_PANEL2, Color.parseColor("#6DB6F2"), 16, Math.max(10f, 16f * pg.scale));
+                        C_PANEL2, Color.parseColor("#6DB6F2"), 16, pg.dirSp);
                     if (dimDirs != null && dimDirs.contains(keys[r][k])) b.setAlpha(0.35f);
                     LinearLayout.LayoutParams bp = new LinearLayout.LayoutParams(DB, DB);
                     if (k > 0) bp.leftMargin = pg.cellGap;
@@ -2159,13 +2281,13 @@ public class MainActivity extends Activity {
         View spA = new View(this);
         rowA.addView(spA, new LinearLayout.LayoutParams(pg.spacer, 1));
         PadButton btnA = new PadButton(B_A, aLabel, Color.parseColor("#B03030"),
-            Color.parseColor("#FF6B6B"), 999, Math.max(10.5f, abSp * pg.scale));
+            Color.parseColor("#FF6B6B"), 999, Math.max(abSp, pg.abSp));
         rowA.addView(btnA, new LinearLayout.LayoutParams(pg.ab, pg.ab));
         ab.addView(rowA);
         LinearLayout rowB = new LinearLayout(this);
         rowB.setOrientation(LinearLayout.HORIZONTAL);
         PadButton btnB = new PadButton(B_B, bLabel, Color.parseColor("#2F7FBF"),
-            Color.parseColor("#6DB6F2"), 999, Math.max(10.5f, abSp * pg.scale));
+            Color.parseColor("#6DB6F2"), 999, Math.max(abSp, pg.abSp));
         rowB.addView(btnB, new LinearLayout.LayoutParams(pg.ab, pg.ab));
         LinearLayout.LayoutParams rb = new LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
@@ -2201,7 +2323,7 @@ public class MainActivity extends Activity {
             tvMineValue = mv;
             row.addView(mv);
             c.addView(row, matchWrap(6));
-            hint = "Bay qua sao là nhặt · A: xô mạnh, đối thủ rơi 1 sao · Sao lớn = 3 sao";
+            hint = "Bay qua sao là nhặt · A: XÔ";
         } else if (gid.equals("giu-vuong-mien")) {
             TextView banner = centerText(crownBanner(v, g), 21,
                 jBool(g, "myCrown", false) ? Color.parseColor("#FFC93D") : C_TEXT, true);
@@ -2215,7 +2337,7 @@ public class MainActivity extends Activity {
             tvMineValue = mv;
             row.addView(mv);
             c.addView(row, matchWrap(2));
-            hint = "Chạm vào vương miện là đội lên đầu · Giữ càng lâu càng nhiều điểm · A: xô người giữ cho rơi";
+            hint = "Giữ vương miện càng lâu càng nhiều điểm";
         } else { // son-san
             JSONArray grid = jArr(g, "grid");
             int total = grid != null ? grid.length() : 144;
@@ -2230,12 +2352,13 @@ public class MainActivity extends Activity {
             c.addView(row, matchWrap(6));
             aLabel = "A\nSƠN BÙNG";
             abSp = 13;
-            hint = "Chạy qua ô nào sơn ô đó · A: sơn bùng 3×3 (hồi 2 giây) · B: lướt nhanh";
+            hint = "Chạy qua ô là sơn · A: SƠN BÙNG 3×3";
         }
-        LinearLayout.LayoutParams pr = matchWrap(16);
+        addFlex(c);
+        LinearLayout.LayoutParams pr = matchWrap(4);
         pr.gravity = Gravity.CENTER_HORIZONTAL;
         c.addView(padCluster(aLabel, "B\nLướt", abSp, null), pr);
-        c.addView(centerText(hint, 14, C_MUTED, false), matchWrap(12));
+        addHint(c, hint);
         return c;
     }
 
@@ -2282,7 +2405,7 @@ public class MainActivity extends Activity {
             tvDefendLine = line;
             c.addView(line, matchWrap(6));
             aLabel = "A\nBẮN";
-            hint = "Bắn slime trước khi chúng chạm vào pha lê · Nòng súng hướng theo hướng di chuyển cuối";
+            hint = "Bắn slime trước khi chúng chạm pha lê";
         } else {
             LinearLayout livesRow = new LinearLayout(this);
             livesRow.setOrientation(LinearLayout.HORIZONTAL);
@@ -2295,16 +2418,17 @@ public class MainActivity extends Activity {
             if (gid.equals("dat-bom")) {
                 aLabel = "A\nĐẶT BOM";
                 abSp = 13;
-                hint = "A: đặt bom (mỗi người 1 quả một lúc) · Bom nổ sau 2 giây theo hình chữ thập — đặt xong chạy ngay!";
+                hint = "Đặt bom xong chạy ngay — nổ chữ thập!";
             } else {
                 aLabel = "A\nBẮN";
-                hint = "Nòng súng hướng theo hướng di chuyển cuối · A: bắn (hồi 1 giây) · Núp sau thùng chắn";
+                hint = "A: BẮN · Núp sau thùng chắn";
             }
         }
-        LinearLayout.LayoutParams pr = matchWrap(16);
+        addFlex(c);
+        LinearLayout.LayoutParams pr = matchWrap(4);
         pr.gravity = Gravity.CENTER_HORIZONTAL;
         c.addView(padCluster(aLabel, "B\nLướt", abSp, null), pr);
-        c.addView(centerText(hint, 14, C_MUTED, false), matchWrap(12));
+        addHint(c, hint);
         c.addView(timerLine("sec"), matchWrap(2));
         return c;
     }
@@ -2428,10 +2552,11 @@ public class MainActivity extends Activity {
         HashSet<String> dim = new HashSet<String>();
         String[] allDirs = { "u", "d", "l", "r" };
         for (int i = 0; i < allDirs.length; i++) if (!mine.contains(allDirs[i])) dim.add(allDirs[i]);
-        LinearLayout.LayoutParams pr = matchWrap(14);
+        addFlex(c);
+        LinearLayout.LayoutParams pr = matchWrap(4);
         pr.gravity = Gravity.CENTER_HORIZONTAL;
         c.addView(padCluster("A\nĐẨY", "B\nLướt", 17, dim), pr);
-        c.addView(centerText("Cả đội lái CHUNG một quả bóng — chỉ hướng của bạn mới chạy theo tay bạn (hướng mờ không thuộc về bạn). Phối hợp đưa bóng chạm sao ⭐, né đạn!", 14, C_MUTED, false), matchWrap(12));
+        addHint(c, "Lái bóng chạm sao ⭐ · Né đạn!");
         c.addView(timerLine("sec"), matchWrap(2));
         return c;
     }
@@ -2454,10 +2579,11 @@ public class MainActivity extends Activity {
         row.addView(dv);
         row.addView(text(" hộp", 20, C_TEXT, true));
         c.addView(row, matchWrap(6));
-        LinearLayout.LayoutParams pr = matchWrap(16);
+        addFlex(c);
+        LinearLayout.LayoutParams pr = matchWrap(4);
         pr.gravity = Gravity.CENTER_HORIZONTAL;
         c.addView(padCluster("A\nĐẨY", "B\nLướt", 17, null), pr);
-        c.addView(centerText("Cùng một đồng đội áp sát hộp và đẩy cùng một hướng — một người đẩy hộp không đi đâu cả!", 14, C_MUTED, false), matchWrap(12));
+        addHint(c, "Hai người cùng đẩy một hướng mới đi!");
         c.addView(timerLine("sec"), matchWrap(2));
         return c;
     }
