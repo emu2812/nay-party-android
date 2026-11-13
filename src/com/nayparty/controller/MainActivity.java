@@ -94,6 +94,15 @@ public class MainActivity extends Activity {
         SEAT_HEX.put("pink", Color.parseColor("#F77FB0"));
         SEAT_HEX.put("green", Color.parseColor("#58C472"));
         SEAT_HEX.put("purple", Color.parseColor("#A78BFA"));
+        // Seats 5-12 (worker SEAT_COLORS order): rooms now hold 12.
+        SEAT_HEX.put("orange", Color.parseColor("#F59E0B"));
+        SEAT_HEX.put("red", Color.parseColor("#E84F4F"));
+        SEAT_HEX.put("cyan", Color.parseColor("#38BDF8"));
+        SEAT_HEX.put("yellow", Color.parseColor("#FFC93D"));
+        SEAT_HEX.put("lime", Color.parseColor("#A3E635"));
+        SEAT_HEX.put("brown", Color.parseColor("#B07D4F"));
+        SEAT_HEX.put("silver", Color.parseColor("#C0C7D1"));
+        SEAT_HEX.put("magenta", Color.parseColor("#E879F9"));
     }
     private static final int[] MEM_HEX = {
         Color.parseColor("#E84F4F"), Color.parseColor("#58C472"),
@@ -167,6 +176,9 @@ public class MainActivity extends Activity {
     private TextView tvDefendLine;      // thu-thanh crystal HP + team kills (updated in place)
     private TextView tvDmg;             // nguoi-que my damage % (updated in place)
     private TextView tvTempleLine;      // den-lua-nuoc gems + team hearts (updated in place)
+    private TextView tvScoreLine;       // da-bong scoreboard (updated in place)
+    private TextView tvFrogLine;        // ech-op hearts/chamber/flies (updated in place)
+    private TextView tvAimAngle, tvAimPower, tvAimFace; // can-goc aim readouts (updated in place)
     private TextView tvCrownLine;       // giu-vuong-mien holder banner (updated in place, no rebuild)
     // cheo-thuyen fast-ticker refs (beat flash runs off server-synced time)
     private Button rowBtn;
@@ -191,6 +203,16 @@ public class MainActivity extends Activity {
 
     // gamepad state
     private final boolean[] padState = new boolean[8];
+
+    // can-goc aim state: local stepper values while it is my turn (the
+    // server stays authoritative — setAim echoes come back in the view
+    // and re-sync these whenever no stepper is being held).
+    private int aimAngle = 45, aimPower = 60, aimFace = 1;
+    private long aimForEndsAt = -1;     // endsAt of the aim phase the locals belong to
+    private int aimHoldCount = 0;       // steppers currently held (blocks readout re-sync)
+    private int aimGen = 0;             // bumped off the can-goc screen: kills repeat loops
+    private long aimLastSentAt = 0;
+    private boolean aimFlushScheduled = false;
 
     // ======================= lifecycle =======================
 
@@ -1394,6 +1416,106 @@ public class MainActivity extends Activity {
             } else if (gid.equals("den-lua-nuoc")) {
                 // Steady pad screen: my element is fixed for the whole
                 // match; hearts/gems refresh in place via tvTempleLine.
+            } else if (gid.equals("ma-soi")) {
+                // Everything a phone may see is its own private kit plus
+                // public facts; rebuild whenever any of it moves (the
+                // discuss chat is serialized like ke-gia-mao's).
+                sb.append(':').append(jStr(g, "myRole", ""));
+                sb.append(':').append(jBool(g, "myAlive", true) ? "alive" : "dead");
+                if (gp.equals("night")) {
+                    sb.append(':').append(g.opt("myWolfVote"));
+                    sb.append(':').append(jInt(g, "wolfVotesIn", 0));
+                    sb.append(':').append(g.opt("myGuardPick"));
+                    sb.append(':').append(g.opt("mySeerPick"));
+                    JSONArray notes = jArr(g, "mySeerNotes");
+                    if (notes != null) {
+                        for (int i = 0; i < notes.length(); i++) {
+                            JSONObject nt = notes.optJSONObject(i);
+                            if (nt != null) sb.append('|').append(jInt(nt, "seat", 0)).append(jBool(nt, "wolf", false) ? "W" : "D");
+                        }
+                    }
+                    sb.append(':').append(jBool(g, "wolvesIn", false) ? "win" : "wout");
+                    sb.append(':').append(g.opt("myVictim"));
+                    sb.append(':').append(jBool(g, "myWitchSave", false) ? "sv" : "nsv");
+                    sb.append(':').append(g.opt("myWitchPoison"));
+                    sb.append(':').append(jBool(g, "myWitchDone", false) ? "wd" : "nwd");
+                    sb.append(':').append(jInt(g, "mySaveLeft", 0)).append('/').append(jInt(g, "myPoisonLeft", 0));
+                } else if (gp.equals("dawn")) {
+                    JSONArray dd = jArr(g, "dawnDeaths");
+                    if (dd != null) {
+                        for (int i = 0; i < dd.length(); i++) {
+                            JSONObject d0 = dd.optJSONObject(i);
+                            if (d0 != null) sb.append('|').append(jInt(d0, "seat", 0));
+                        }
+                    }
+                } else if (gp.equals("discuss")) {
+                    JSONArray chat = jArr(g, "chatLog");
+                    if (chat != null) {
+                        for (int i = 0; i < chat.length(); i++) {
+                            JSONObject cm = chat.optJSONObject(i);
+                            if (cm != null) sb.append('|').append(jInt(cm, "seat", 0)).append(':').append(jStr(cm, "text", ""));
+                        }
+                    }
+                } else if (gp.equals("vote")) {
+                    JSONObject voted = jObj(g, "voted");
+                    JSONArray ps2 = jArr(v, "players");
+                    if (voted != null && ps2 != null) {
+                        for (int i = 0; i < ps2.length(); i++) {
+                            JSONObject p2 = ps2.optJSONObject(i);
+                            if (p2 != null) sb.append('|').append(voted.optBoolean(String.valueOf(jInt(p2, "seat", 0)), false) ? 1 : 0);
+                        }
+                    }
+                } else if (gp.equals("execute") || gp.equals("wolfEnd")) {
+                    JSONObject ex = jObj(g, "exec");
+                    sb.append(':').append(ex == null ? "" : String.valueOf(ex.opt("seat")));
+                    sb.append(':').append(jStr(g, "winner", ""));
+                }
+            } else if (gid.equals("ca-ngua")) {
+                // Turn flow is discrete state: turn, dice, every horse,
+                // the event log tail and my legal moves drive rebuilds.
+                sb.append(':').append(g.opt("turn"));
+                sb.append(':').append(g.opt("dice"));
+                JSONObject hs = jObj(g, "horses");
+                JSONArray ps3 = jArr(v, "players");
+                if (hs != null && ps3 != null) {
+                    for (int i = 0; i < ps3.length(); i++) {
+                        JSONObject p3 = ps3.optJSONObject(i);
+                        if (p3 == null) continue;
+                        JSONArray hh = hs.optJSONArray(String.valueOf(jInt(p3, "seat", 0)));
+                        if (hh != null) for (int k = 0; k < hh.length(); k++) sb.append(',').append(hh.optInt(k, 0));
+                        sb.append(';');
+                    }
+                }
+                JSONArray lg2 = jArr(g, "log");
+                sb.append(':').append(lg2 == null ? 0 : lg2.length());
+                if (lg2 != null && lg2.length() > 0) sb.append(':').append(lg2.optString(lg2.length() - 1, ""));
+                JSONArray ml = jArr(g, "myLegal");
+                sb.append(':').append(ml == null ? 0 : ml.length());
+                sb.append(':').append(g.opt("winner"));
+            } else if (gid.equals("da-bong")) {
+                // Steady pad screen: the scoreboard refreshes in place
+                // (tvScoreLine); only the goal banner needs a rebuild,
+                // and the phase flip soccer<->goal already forces one.
+                JSONObject gi = jObj(g, "goalInfo");
+                if (gi != null) sb.append(':').append(jStr(gi, "team", "")).append(':').append(gi.opt("by"));
+            } else if (gid.equals("ech-op")) {
+                // Belly state drives the whole screen (pad vs in-belly
+                // card vs carrying chip); hearts/flies/chamber refresh
+                // in place via tvFrogLine.
+                sb.append(':').append(jStr(g, "myState", "free"));
+                sb.append(':').append(g.opt("myPassengerSeat"));
+                sb.append(':').append(g.opt("myCarrierSeat"));
+            } else if (gid.equals("can-goc")) {
+                // Turn, wind and my cannon's survival drive rebuilds.
+                // Angle/power must NOT be here: they refresh in place
+                // (updateDynamic) so a held stepper is never rebuilt
+                // out from under the thumb.
+                sb.append(':').append(g.opt("turn"));
+                sb.append(':').append(jInt(g, "wind", 0));
+                JSONObject mc = jObj(g, "myCannon");
+                sb.append(':').append(mc == null ? "?" : (jBool(mc, "alive", true) ? "alive" : "dead"));
+                JSONObject bm = jObj(g, "boom");
+                if (bm != null) sb.append(':').append(jLong(bm, "at", 0));
             }
             return sb.toString();
         }
@@ -1470,6 +1592,26 @@ public class MainActivity extends Activity {
         if (gid.equals("cheo-thuyen")) {
             if (tvRowHits != null) tvRowHits.setText(String.valueOf(jInt(g, "mine", 0)));
             if (tvRowSplash != null) tvRowSplash.setText(String.valueOf(jInt(g, "mySplash", 0)));
+        }
+        if (gid.equals("da-bong") && tvScoreLine != null) {
+            tvScoreLine.setText(soccerScoreText(g));
+        }
+        if (gid.equals("ech-op") && tvFrogLine != null) {
+            tvFrogLine.setText(frogLineText(g));
+        }
+        if (gid.equals("can-goc") && tvAimAngle != null && aimHoldCount == 0
+                && jStr(g, "phase", "").equals("aim") && jBool(g, "myTurn", false)) {
+            // Re-sync the local aim from the authoritative view (my own
+            // setAim echoes land here) — never while a stepper is held,
+            // or a mid-hold echo would fight the thumb by a step.
+            JSONObject mc = jObj(g, "myCannon");
+            if (mc != null) {
+                aimAngle = (int) Math.round(jDouble(mc, "angle", aimAngle));
+                aimPower = jInt(mc, "power", aimPower);
+                int f = jInt(mc, "face", 0);
+                if (f != 0) aimFace = f;
+                refreshAimReadouts();
+            }
         }
     }
 
@@ -2082,6 +2224,11 @@ public class MainActivity extends Activity {
         if (gid.equals("giai-ma-chung")) return new int[] { 0xFF191238, 0xFF08061A };
         if (gid.equals("nguoi-que")) return new int[] { 0xFF2A0A16, 0xFF0D0309 };
         if (gid.equals("den-lua-nuoc")) return new int[] { 0xFF241305, 0xFF0A0501 };
+        if (gid.equals("ma-soi")) return new int[] { 0xFF2A1060, 0xFF0D0618 };
+        if (gid.equals("ca-ngua")) return new int[] { 0xFF4A2405, 0xFF1A0D02 };
+        if (gid.equals("da-bong")) return new int[] { 0xFF0B3D1E, 0xFF04150A };
+        if (gid.equals("ech-op")) return new int[] { 0xFF2E1C07, 0xFF0D0701 };
+        if (gid.equals("can-goc")) return new int[] { 0xFF0E2233, 0xFF050C14 };
         return new int[] { C_PANEL, C_BG };
     }
 
@@ -2113,7 +2260,11 @@ public class MainActivity extends Activity {
         // refs so the ticker idles until rowBoat() installs fresh ones.
         rowBtn = null; rowTrack = null; rowFill = null;
         tvRowMeta = null; tvRowHits = null; tvRowSplash = null;
+        tvScoreLine = null; tvFrogLine = null;
+        tvAimAngle = null; tvAimPower = null; tvAimFace = null;
         String gid = jStr(g, "id", "");
+        // Leaving the cannon screen kills any held-stepper repeat loop.
+        if (!gid.equals("can-goc")) aimGen++;
         String gp = jStr(g, "phase", "");
         int[] sc = stageColors(gid);
         if (gp.equals("countdown")) {
@@ -2146,6 +2297,11 @@ public class MainActivity extends Activity {
         else if (gid.equals("giai-ma-chung")) inner = giaiMaChung(v, g);
         else if (gid.equals("nguoi-que")) inner = fightPad(v, g);
         else if (gid.equals("den-lua-nuoc")) inner = templePad(v, g);
+        else if (gid.equals("ma-soi")) inner = maSoi(v, g);
+        else if (gid.equals("ca-ngua")) inner = caNgua(v, g);
+        else if (gid.equals("da-bong")) inner = soccerPad(v, g);
+        else if (gid.equals("ech-op")) inner = frogPad(v, g);
+        else if (gid.equals("can-goc")) inner = cannonAim(v, g);
         else {
             inner = col();
             inner.addView(centerText("Đang chơi: " + jStr(g, "name", ""), 18, C_TEXT, true));
@@ -4004,6 +4160,958 @@ public class MainActivity extends Activity {
         c.addView(grid);
         c.addView(centerText("Chỉ bấm khi tới lượt bước của bạn và đúng ký hiệu của bước đó — bấm sai cả đội mất 1 tim!", 14, C_MUTED, false), matchWrap(10));
         c.addView(timerLine("sec"), matchWrap(2));
+        return c;
+    }
+
+    // ======================= shared helpers for the v1.8 games =======================
+
+    private String playerName(JSONObject v, int seat) {
+        JSONObject p = playerBySeat(v, seat);
+        return p != null ? jStr(p, "name", "") : ("P" + seat);
+    }
+
+    private static boolean containsSeat(JSONArray arr, int seat) {
+        if (arr == null) return false;
+        for (int i = 0; i < arr.length(); i++) if (arr.optInt(i, -1) == seat) return true;
+        return false;
+    }
+
+    /** One full-width seat-picker button in the target's seat colour. */
+    private Button pickButton(JSONObject v, int seat, String suffix, Runnable action) {
+        JSONObject p = playerBySeat(v, seat);
+        Integer pc = p == null ? null : SEAT_HEX.get(jStr(p, "color", "blue"));
+        Button b = bigButton(playerName(v, seat) + (suffix == null ? "" : suffix),
+            pc != null ? pc : C_PANEL2, Color.WHITE, 19);
+        fireOnDown(b, action);
+        return b;
+    }
+
+    // ---------- Ma Sói (versus: hidden roles, night/day cycle) ----------
+    // PRIVACY mirrors the server: the view hands this phone ONLY its own
+    // role kit (myRole + the role-specific pick fields); there is nothing
+    // else secret in the payload to render. Night picks are one-shot on
+    // the server; the screens key off the confirmed fields (myWolfVote,
+    // myGuardPick, mySeerPick, myWitch*) and lockKey only bridges the
+    // round-trip so a double-tap can't fire twice.
+    private String wolfChatDraft = "";
+
+    private static String wolfRoleName(String role) {
+        if (role.equals("soi")) return "Sói 🐺";
+        if (role.equals("tien-tri")) return "Tiên Tri 🔮";
+        if (role.equals("bao-ve")) return "Bảo Vệ 🛡️";
+        if (role.equals("phu-thuy")) return "Phù Thủy 🧙";
+        return "Dân Làng 🧑‍🌾";
+    }
+
+    private int wolfRoleColor(String role) {
+        if (role.equals("soi")) return Color.parseColor("#B03030");
+        if (role.equals("tien-tri")) return Color.parseColor("#7C3AED");
+        if (role.equals("bao-ve")) return Color.parseColor("#2F7FBF");
+        if (role.equals("phu-thuy")) return Color.parseColor("#B83A8C");
+        return Color.parseColor("#1E7A46");
+    }
+
+    private boolean wolfAlive(JSONObject g, int seat) {
+        JSONObject am = jObj(g, "aliveMap");
+        return am == null || am.optBoolean(String.valueOf(seat), true);
+    }
+
+    private void addDeadList(LinearLayout body, JSONObject v, JSONObject g) {
+        JSONArray dl = jArr(g, "deadList");
+        if (dl == null || dl.length() == 0) return;
+        body.addView(text("Đã mất:", 15, C_MUTED, true), matchWrap(10));
+        for (int i = 0; i < dl.length(); i++) {
+            JSONObject d = dl.optJSONObject(i);
+            if (d == null) continue;
+            body.addView(text("💀 " + playerName(v, jInt(d, "seat", -1)) + " — "
+                + wolfRoleName(jStr(d, "role", "")), 16, C_TEXT, false), matchWrap(3));
+        }
+    }
+
+    private LinearLayout maSoi(JSONObject v, JSONObject g) {
+        LinearLayout c = col();
+        final String gp = jStr(g, "phase", "");
+        final int night = jInt(g, "night", jInt(g, "round", 1));
+        final String myRole = jStr(g, "myRole", "");
+        final boolean myAlive = jBool(g, "myAlive", true);
+        final JSONArray ps = jArr(v, "players");
+
+        // Role card: the one secret this phone holds, shown all game.
+        if (myRole.length() > 0) {
+            TextView chip = centerText("Vai của bạn: " + wolfRoleName(myRole)
+                + (myAlive ? "" : " · 💀 ĐÃ CHẾT"), 17, Color.WHITE, true);
+            chip.setBackground(roundRect(wolfRoleColor(myRole), Color.WHITE, 16));
+            chip.setPadding(dp(14), dp(6), dp(14), dp(6));
+            LinearLayout.LayoutParams chp = lp(ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT, 2);
+            chp.gravity = Gravity.CENTER_HORIZONTAL;
+            c.addView(chip, chp);
+        }
+        String banner = gp.equals("night") ? "🌙 ĐÊM " + night + " — LÀNG ĐANG NGỦ…"
+            : gp.equals("dawn") ? "☀️ BÌNH MINH ĐÊM " + night
+            : gp.equals("discuss") ? "🗣️ BÀN LUẬN — AI LÀ SÓI?"
+            : gp.equals("vote") ? "🗳️ BỎ PHIẾU TREO CỔ"
+            : gp.equals("execute") ? "⚖️ KẾT QUẢ BỎ PHIẾU"
+            : gp.equals("wolfEnd") ? "🏁 KẾT THÚC!" : "";
+        if (banner.length() > 0) c.addView(centerText(banner, 19, C_TEXT, true), matchWrap(4));
+
+        LinearLayout body = col();
+        if (gp.equals("night")) {
+            if (!myAlive) {
+                body.addView(centerText("💀 Bạn đã chết — theo dõi diễn biến trên TV nhé.", 18, C_TEXT, true), matchWrap(16));
+                addDeadList(body, v, g);
+            } else if (myRole.equals("soi")) {
+                final JSONArray team = jArr(g, "wolfTeam");
+                StringBuilder names = new StringBuilder();
+                if (team != null) {
+                    for (int i = 0; i < team.length(); i++) {
+                        if (i > 0) names.append(", ");
+                        names.append(playerName(v, team.optInt(i, -1)));
+                    }
+                }
+                body.addView(centerText("🐺 Bầy sói: " + names, 17, C_TEXT, true), matchWrap(6));
+                Object myVote = g.opt("myWolfVote");
+                if (myVote instanceof Number) {
+                    body.addView(centerText("Đã chọn con mồi: " + playerName(v, ((Number) myVote).intValue()), 19, C_TEXT, true), matchWrap(8));
+                    body.addView(centerText("Phiếu sói đã vào: " + jInt(g, "wolfVotesIn", 0)
+                        + "/" + (team == null ? 0 : team.length()), 15, C_MUTED, false), matchWrap(2));
+                } else {
+                    body.addView(centerText("Chọn con mồi đêm nay:", 17, C_MUTED, true), matchWrap(6));
+                    final String lock = "ma-soi:wolfVote:" + night;
+                    if (ps != null) {
+                        for (int i = 0; i < ps.length(); i++) {
+                            JSONObject p = ps.optJSONObject(i);
+                            if (p == null) continue;
+                            final int ts = jInt(p, "seat", -1);
+                            if (ts < 0 || ts == sSeat || !wolfAlive(g, ts)) continue;
+                            Button b = pickButton(v, ts, containsSeat(team, ts) ? " 🐺 đồng đội" : "", new Runnable() {
+                                @Override public void run() {
+                                    if (lockKey.equals(lock)) return;
+                                    lockKey = lock;
+                                    JSONObject bdy = actionBody("wolfVote");
+                                    try { bdy.put("seat", ts); } catch (Exception ignored) { }
+                                    vibrate(25);
+                                    sendAction(bdy, true);
+                                }
+                            });
+                            body.addView(b, lp(ViewGroup.LayoutParams.MATCH_PARENT, dp(56), 8));
+                        }
+                    }
+                }
+            } else if (myRole.equals("bao-ve")) {
+                Object pick = g.opt("myGuardPick");
+                if (pick instanceof Number) {
+                    body.addView(centerText("🛡️ Đêm nay bạn bảo vệ: " + playerName(v, ((Number) pick).intValue()), 19, C_TEXT, true), matchWrap(10));
+                } else {
+                    body.addView(centerText("Chọn người để bảo vệ đêm nay:", 17, C_MUTED, true), matchWrap(6));
+                    final Object last = g.opt("myGuardLast");
+                    final String lock = "ma-soi:wolfGuard:" + night;
+                    if (ps != null) {
+                        for (int i = 0; i < ps.length(); i++) {
+                            JSONObject p = ps.optJSONObject(i);
+                            if (p == null) continue;
+                            final int ts = jInt(p, "seat", -1);
+                            if (ts < 0 || !wolfAlive(g, ts)) continue;
+                            // The server refuses last night's target again.
+                            if (last instanceof Number && ((Number) last).intValue() == ts) continue;
+                            Button b = pickButton(v, ts, ts == sSeat ? " (chính bạn)" : "", new Runnable() {
+                                @Override public void run() {
+                                    if (lockKey.equals(lock)) return;
+                                    lockKey = lock;
+                                    JSONObject bdy = actionBody("wolfGuard");
+                                    try { bdy.put("seat", ts); } catch (Exception ignored) { }
+                                    vibrate(25);
+                                    sendAction(bdy, true);
+                                }
+                            });
+                            body.addView(b, lp(ViewGroup.LayoutParams.MATCH_PARENT, dp(56), 8));
+                        }
+                    }
+                    if (last instanceof Number) {
+                        body.addView(centerText("Đêm qua bạn đã bảo vệ " + playerName(v, ((Number) last).intValue())
+                            + " — luật không cho bảo vệ lại đêm nay.", 14, C_MUTED, false), matchWrap(8));
+                    }
+                }
+            } else if (myRole.equals("tien-tri")) {
+                Object pick = g.opt("mySeerPick");
+                JSONArray notes = jArr(g, "mySeerNotes");
+                if (pick instanceof Number) {
+                    int ts = ((Number) pick).intValue();
+                    Boolean isWolf = null;
+                    if (notes != null) {
+                        for (int i = 0; i < notes.length(); i++) {
+                            JSONObject nt = notes.optJSONObject(i);
+                            if (nt != null && jInt(nt, "seat", -1) == ts) isWolf = jBool(nt, "wolf", false);
+                        }
+                    }
+                    boolean wolf = isWolf != null && isWolf;
+                    body.addView(centerText("🔮 " + playerName(v, ts) + (wolf ? " LÀ SÓI! 🐺" : " là dân lành ✅"),
+                        21, wolf ? C_RED : C_GREEN, true), matchWrap(10));
+                } else {
+                    body.addView(centerText("Soi một người đêm nay:", 17, C_MUTED, true), matchWrap(6));
+                    final String lock = "ma-soi:wolfSeer:" + night;
+                    if (ps != null) {
+                        for (int i = 0; i < ps.length(); i++) {
+                            JSONObject p = ps.optJSONObject(i);
+                            if (p == null) continue;
+                            final int ts = jInt(p, "seat", -1);
+                            if (ts < 0 || ts == sSeat || !wolfAlive(g, ts)) continue;
+                            Button b = pickButton(v, ts, "", new Runnable() {
+                                @Override public void run() {
+                                    if (lockKey.equals(lock)) return;
+                                    lockKey = lock;
+                                    JSONObject bdy = actionBody("wolfSeer");
+                                    try { bdy.put("seat", ts); } catch (Exception ignored) { }
+                                    vibrate(25);
+                                    sendAction(bdy, true);
+                                }
+                            });
+                            body.addView(b, lp(ViewGroup.LayoutParams.MATCH_PARENT, dp(56), 8));
+                        }
+                    }
+                }
+                if (notes != null && notes.length() > 0) {
+                    body.addView(text("Sổ tay tiên tri:", 15, C_MUTED, true), matchWrap(10));
+                    for (int i = 0; i < notes.length(); i++) {
+                        JSONObject nt = notes.optJSONObject(i);
+                        if (nt == null) continue;
+                        body.addView(text("🔮 " + playerName(v, jInt(nt, "seat", -1)) + ": "
+                            + (jBool(nt, "wolf", false) ? "🐺 SÓI" : "✅ dân lành"), 16, C_TEXT, false), matchWrap(3));
+                    }
+                }
+            } else if (myRole.equals("phu-thuy")) {
+                body.addView(centerText("Thuốc cứu còn: " + jInt(g, "mySaveLeft", 0)
+                    + " · Thuốc độc còn: " + jInt(g, "myPoisonLeft", 0), 16, C_TEXT, true), matchWrap(4));
+                if (jBool(g, "myWitchDone", false)) {
+                    body.addView(centerText("✔ Đã chốt lựa chọn cho đêm nay.", 19, C_TEXT, true), matchWrap(10));
+                } else if (!jBool(g, "wolvesIn", false)) {
+                    body.addView(centerText("Đợi bầy sói chọn xong con mồi đã… 🐺", 17, C_MUTED, false), matchWrap(10));
+                } else {
+                    Object victim = g.opt("myVictim");
+                    final boolean saveOn = jBool(g, "myWitchSave", false);
+                    if (victim instanceof Number) {
+                        final String vName = playerName(v, ((Number) victim).intValue());
+                        body.addView(centerText("Con mồi của sói đêm nay: " + vName, 19, C_RED, true), matchWrap(6));
+                        if (jInt(g, "mySaveLeft", 0) > 0 || saveOn) {
+                            Button sv = bigButton(saveOn ? "💊 ĐÃ DẶN CỨU " + vName + " (bấm để huỷ cứu)"
+                                    : "💊 Cứu " + vName,
+                                saveOn ? Color.parseColor("#1FA855") : C_PANEL2, C_GREEN, 18);
+                            body.addView(sv, lp(ViewGroup.LayoutParams.MATCH_PARENT, dp(56), 8));
+                            fireOnDown(sv, new Runnable() {
+                                @Override public void run() {
+                                    JSONObject bdy = actionBody("wolfWitch");
+                                    try { bdy.put("save", !saveOn); } catch (Exception ignored) { }
+                                    vibrate(25);
+                                    sendAction(bdy, true);
+                                }
+                            });
+                        }
+                    } else {
+                        body.addView(centerText("Đêm nay sói chưa chọn được ai.", 16, C_MUTED, false), matchWrap(6));
+                    }
+                    Object poison = g.opt("myWitchPoison");
+                    if (jInt(g, "myPoisonLeft", 0) > 0) {
+                        if (poison instanceof Number) {
+                            body.addView(centerText("☠️ Sẽ đầu độc: " + playerName(v, ((Number) poison).intValue()), 18, C_TEXT, true), matchWrap(8));
+                            Button cancel = bigButton("Huỷ thuốc độc", C_PANEL2, C_MUTED, 16);
+                            body.addView(cancel, lp(ViewGroup.LayoutParams.MATCH_PARENT, dp(50), 6));
+                            fireOnDown(cancel, new Runnable() {
+                                @Override public void run() {
+                                    JSONObject bdy = actionBody("wolfWitch");
+                                    try { bdy.put("poison", JSONObject.NULL); } catch (Exception ignored) { }
+                                    sendAction(bdy, true);
+                                }
+                            });
+                            body.addView(centerText("Hoặc chọn người khác để đổi mục tiêu:", 14, C_MUTED, false), matchWrap(6));
+                        } else {
+                            body.addView(centerText("Đầu độc ai đó (không bắt buộc):", 15, C_MUTED, true), matchWrap(8));
+                        }
+                        if (ps != null) {
+                            for (int i = 0; i < ps.length(); i++) {
+                                JSONObject p = ps.optJSONObject(i);
+                                if (p == null) continue;
+                                final int ts = jInt(p, "seat", -1);
+                                if (ts < 0 || ts == sSeat || !wolfAlive(g, ts)) continue;
+                                if (poison instanceof Number && ((Number) poison).intValue() == ts) continue;
+                                Button b = pickButton(v, ts, " ☠️", new Runnable() {
+                                    @Override public void run() {
+                                        JSONObject bdy = actionBody("wolfWitch");
+                                        try { bdy.put("poison", ts); } catch (Exception ignored) { }
+                                        vibrate(25);
+                                        sendAction(bdy, true);
+                                    }
+                                });
+                                body.addView(b, lp(ViewGroup.LayoutParams.MATCH_PARENT, dp(52), 8));
+                            }
+                        }
+                    }
+                    Button done = bigButton("✔ Xong — chốt đêm nay", Color.parseColor("#2F7FBF"), Color.parseColor("#6DB6F2"), 18);
+                    body.addView(done, lp(ViewGroup.LayoutParams.MATCH_PARENT, dp(56), 12));
+                    fireOnDown(done, new Runnable() {
+                        @Override public void run() {
+                            JSONObject bdy = actionBody("wolfWitch");
+                            try { bdy.put("done", true); } catch (Exception ignored) { }
+                            vibrate(25);
+                            sendAction(bdy, true);
+                        }
+                    });
+                }
+            } else {
+                body.addView(centerText("🌙 Bạn ngủ yên nhé… mong trời mau sáng.", 18, C_TEXT, false), matchWrap(16));
+            }
+        } else if (gp.equals("dawn")) {
+            JSONArray dd = jArr(g, "dawnDeaths");
+            if (dd == null || dd.length() == 0) {
+                body.addView(centerText("Đêm qua bình yên — không ai chết! 🎉", 20, C_GREEN, true), matchWrap(14));
+            } else {
+                body.addView(centerText("Đêm qua làng đã mất:", 18, C_TEXT, true), matchWrap(8));
+                for (int i = 0; i < dd.length(); i++) {
+                    JSONObject d = dd.optJSONObject(i);
+                    if (d == null) continue;
+                    body.addView(centerText("💀 " + playerName(v, jInt(d, "seat", -1)) + " — "
+                        + wolfRoleName(jStr(d, "role", "")), 18, C_TEXT, true), matchWrap(4));
+                }
+            }
+        } else if (gp.equals("discuss")) {
+            LinearLayout msgs = col();
+            JSONArray chat = jArr(g, "chatLog");
+            if (chat != null) {
+                for (int i = 0; i < chat.length(); i++) {
+                    JSONObject cm = chat.optJSONObject(i);
+                    if (cm == null) continue;
+                    JSONObject who = playerBySeat(v, jInt(cm, "seat", -1));
+                    TextView line = text((who == null ? "" : jStr(who, "name", "")) + ": " + jStr(cm, "text", ""),
+                        16, C_TEXT, jInt(cm, "seat", -1) == sSeat);
+                    line.setBackground(roundRect(C_PANEL2, C_PANEL2, 12));
+                    line.setPadding(dp(12), dp(8), dp(12), dp(8));
+                    msgs.addView(line, matchWrap(6));
+                }
+            }
+            final ScrollView sv = new ScrollView(this);
+            sv.addView(msgs);
+            body.addView(sv, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
+            sv.post(new Runnable() {
+                @Override public void run() { sv.fullScroll(View.FOCUS_DOWN); }
+            });
+            if (myAlive) {
+                // Same composer as the impostor game's discussion.
+                LinearLayout rowL = new LinearLayout(this);
+                rowL.setOrientation(LinearLayout.HORIZONTAL);
+                final EditText chatIn = new EditText(this);
+                chatIn.setInputType(InputType.TYPE_CLASS_TEXT);
+                chatIn.setFilters(new android.text.InputFilter[] { new android.text.InputFilter.LengthFilter(60) });
+                chatIn.setTextSize(TypedValue.COMPLEX_UNIT_SP, 17);
+                chatIn.setTextColor(C_TEXT);
+                chatIn.setHintTextColor(C_MUTED);
+                chatIn.setHint("Nói gì đó…");
+                chatIn.setBackground(roundRect(C_PANEL2, accent(), 14));
+                chatIn.setPadding(dp(12), dp(8), dp(12), dp(8));
+                chatIn.setText(wolfChatDraft);
+                chatIn.setSelection(chatIn.getText().length());
+                chatIn.addTextChangedListener(new android.text.TextWatcher() {
+                    @Override public void beforeTextChanged(CharSequence s, int a, int b, int n) { }
+                    @Override public void onTextChanged(CharSequence s, int a, int b, int n) { wolfChatDraft = s.toString(); }
+                    @Override public void afterTextChanged(android.text.Editable s) { }
+                });
+                rowL.addView(chatIn, new LinearLayout.LayoutParams(0, dp(52), 1f));
+                Button send = bigButton("Gửi", Color.parseColor("#2F7FBF"), Color.parseColor("#6DB6F2"), 17);
+                LinearLayout.LayoutParams sbp = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT, dp(52));
+                sbp.leftMargin = dp(8);
+                rowL.addView(send, sbp);
+                send.setOnClickListener(new View.OnClickListener() {
+                    @Override public void onClick(View vw) {
+                        String txt = chatIn.getText().toString().trim();
+                        if (txt.length() == 0) { toast("Nhập lời nhắn trước đã."); return; }
+                        wolfChatDraft = "";
+                        chatIn.setText("");
+                        JSONObject bdy = actionBody("chat");
+                        try { bdy.put("text", txt); } catch (Exception ignored) { }
+                        sendAction(bdy, true);
+                    }
+                });
+                body.addView(rowL, matchWrap(10));
+            } else {
+                body.addView(centerText("💀 Bạn đã chết — chỉ theo dõi thôi, không trò chuyện được.", 15, C_MUTED, false), matchWrap(8));
+            }
+        } else if (gp.equals("vote")) {
+            if (!myAlive) {
+                body.addView(centerText("💀 Bạn đã chết — theo dõi kết quả bỏ phiếu trên TV nhé.", 18, C_TEXT, true), matchWrap(16));
+                addDeadList(body, v, g);
+            } else {
+                JSONObject voted = jObj(g, "voted");
+                boolean iVoted = (voted != null && voted.optBoolean(String.valueOf(sSeat), false))
+                    || lockKey.equals("ma-soi:v:" + night);
+                int inCount = 0, aliveCount = 0;
+                if (ps != null) {
+                    for (int i = 0; i < ps.length(); i++) {
+                        JSONObject p = ps.optJSONObject(i);
+                        if (p == null) continue;
+                        int ts = jInt(p, "seat", -1);
+                        if (!wolfAlive(g, ts)) continue;
+                        aliveCount++;
+                        if (voted != null && voted.optBoolean(String.valueOf(ts), false)) inCount++;
+                    }
+                }
+                if (iVoted) {
+                    body.addView(centerText("Đã bỏ phiếu ✔ Đợi kết quả…", 21, C_TEXT, true), matchWrap(14));
+                } else {
+                    body.addView(centerText("Bạn nghi ai là sói? Treo cổ người đó!", 18, C_TEXT, true), matchWrap(6));
+                    final String lock = "ma-soi:v:" + night;
+                    if (ps != null) {
+                        for (int i = 0; i < ps.length(); i++) {
+                            JSONObject p = ps.optJSONObject(i);
+                            if (p == null) continue;
+                            final int ts = jInt(p, "seat", -1);
+                            if (ts < 0 || ts == sSeat || !wolfAlive(g, ts)) continue;
+                            Button b = pickButton(v, ts, "", new Runnable() {
+                                @Override public void run() {
+                                    if (lockKey.equals(lock)) return;
+                                    lockKey = lock;
+                                    JSONObject bdy = actionBody("vote");
+                                    try { bdy.put("seat", ts); } catch (Exception ignored) { }
+                                    vibrate(25);
+                                    sendAction(bdy, true);
+                                }
+                            });
+                            body.addView(b, lp(ViewGroup.LayoutParams.MATCH_PARENT, dp(56), 8));
+                        }
+                    }
+                }
+                body.addView(centerText("Đã vào phiếu: " + inCount + "/" + aliveCount + " người còn sống", 15, C_MUTED, false), matchWrap(8));
+            }
+        } else if (gp.equals("execute")) {
+            JSONObject ex = jObj(g, "exec");
+            if (ex != null && ex.opt("seat") instanceof Number) {
+                int es = ((Number) ex.opt("seat")).intValue();
+                body.addView(centerText("⚖️ " + playerName(v, es) + " bị treo cổ!", 22, C_RED, true), matchWrap(10));
+                body.addView(centerText("Vai của họ: " + wolfRoleName(jStr(ex, "role", "")), 18, C_TEXT, true), matchWrap(4));
+            } else {
+                body.addView(centerText("⚖️ Hoà phiếu — không ai bị treo cổ.", 20, C_TEXT, true), matchWrap(10));
+            }
+            JSONObject tally = jObj(g, "voteTally");
+            if (tally != null) {
+                body.addView(text("Số phiếu:", 15, C_MUTED, true), matchWrap(8));
+                Iterator<String> kit = tally.keys();
+                while (kit.hasNext()) {
+                    String ks = kit.next();
+                    int ts = -1;
+                    try { ts = Integer.parseInt(ks); } catch (Exception ignored) { }
+                    if (ts < 0) continue;
+                    body.addView(text(playerName(v, ts) + " — " + tally.optInt(ks, 0) + " phiếu", 16, C_TEXT, false), matchWrap(3));
+                }
+            }
+        } else if (gp.equals("wolfEnd")) {
+            String winner = jStr(g, "winner", "");
+            boolean wolfWon = winner.equals("soi");
+            body.addView(centerText(wolfWon ? "🐺 BẦY SÓI THẮNG!" : "🧑‍🌾 DÂN LÀNG THẮNG!",
+                26, wolfWon ? C_RED : C_GREEN, true), matchWrap(8));
+            if (myRole.length() > 0) {
+                boolean iWon = wolfWon == myRole.equals("soi");
+                body.addView(centerText(iWon ? "Bạn ở phe thắng! 🎉" : "Phe của bạn đã thua.", 16, C_TEXT, false), matchWrap(2));
+            }
+            JSONObject roles = jObj(g, "roles");
+            body.addView(text("Tất cả vai trò:", 15, C_MUTED, true), matchWrap(8));
+            if (ps != null) {
+                for (int i = 0; i < ps.length(); i++) {
+                    JSONObject p = ps.optJSONObject(i);
+                    if (p == null) continue;
+                    int ts = jInt(p, "seat", -1);
+                    String role = roles == null ? "" : jStr(roles, String.valueOf(ts), "");
+                    body.addView(text(playerName(v, ts) + " — " + wolfRoleName(role)
+                        + (wolfAlive(g, ts) ? "" : " 💀"), 16, C_TEXT, ts == sSeat), matchWrap(3));
+                }
+            }
+        } else {
+            body.addView(centerText("Đợi…", 18, C_MUTED, false), matchWrap(20));
+        }
+
+        if (gp.equals("discuss")) {
+            // Discuss keeps its own weighted layout (chat + composer).
+            LinearLayout.LayoutParams bp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f);
+            bp.topMargin = dp(6);
+            c.addView(body, bp);
+        } else {
+            // Pickers at 12 players are long: the body scrolls, the role
+            // card and banner stay pinned.
+            ScrollView sv = new ScrollView(this);
+            sv.addView(body);
+            LinearLayout.LayoutParams bp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f);
+            bp.topMargin = dp(6);
+            c.addView(sv, bp);
+        }
+        c.addView(timerLine("sec"), matchWrap(2));
+        return c;
+    }
+
+    // ---------- Cờ Cá Ngựa (versus: turn-based dice board) ----------
+    // Self-healing tap lock: the roll/move transition lands within a
+    // few hundred ms (response view or WS push); 1.2s of lockout kills
+    // double-taps yet can never wedge the screen if a send got lost.
+    private long nguaLockUntil = 0;
+
+    private boolean nguaTryLock() {
+        long now = System.currentTimeMillis();
+        if (now < nguaLockUntil) return false;
+        nguaLockUntil = now + 1200;
+        return true;
+    }
+
+    private int nguaHome(JSONObject horses, int seat) {
+        JSONArray hh = horses == null ? null : horses.optJSONArray(String.valueOf(seat));
+        if (hh == null) return 0;
+        int n = 0;
+        for (int i = 0; i < hh.length(); i++) if (hh.optInt(i, 0) == 58) n++;
+        return n;
+    }
+
+    private LinearLayout caNgua(JSONObject v, JSONObject g) {
+        LinearLayout c = col();
+        c.setGravity(Gravity.CENTER_HORIZONTAL);
+        String gp = jStr(g, "phase", "");
+        int turn = jInt(g, "turn", -1);
+        boolean myTurn = jBool(g, "myTurn", false);
+        JSONObject horses = jObj(g, "horses");
+        if (gp.equals("ngWin")) {
+            int winner = jInt(g, "winner", -1);
+            c.addView(centerText(winner == sSeat ? "🎉 BẠN THẮNG!"
+                : "🏆 " + playerName(v, winner) + " THẮNG!", 28, winner == sSeat ? C_GREEN : C_TEXT, true), matchWrap(16));
+            c.addView(centerText("Ngựa của bạn đã về chuồng: " + nguaHome(horses, sSeat) + "/4", 17, C_MUTED, false), matchWrap(4));
+            return c;
+        }
+        c.addView(centerText(myTurn ? "🎲 TỚI LƯỢT BẠN!" : "Lượt của " + playerName(v, turn),
+            22, myTurn ? Color.parseColor("#FFC93D") : C_TEXT, true), matchWrap(4));
+        Object dice = g.opt("dice");
+        if (dice instanceof Number) {
+            c.addView(centerText("Xúc xắc: 🎲 " + ((Number) dice).intValue(), 19, C_TEXT, true), matchWrap(2));
+        }
+        c.addView(centerText("Ngựa của bạn đã về chuồng: " + nguaHome(horses, sSeat) + "/4", 15, C_MUTED, true), matchWrap(2));
+        if (gp.equals("roll") && myTurn) {
+            Button b = bigButton("🎲 THẢY XÚC XẮC", Color.parseColor("#D97706"), Color.parseColor("#FFC93D"), 26);
+            c.addView(b, lp(ViewGroup.LayoutParams.MATCH_PARENT, dp(84), 14));
+            fireOnDown(b, new Runnable() {
+                @Override public void run() {
+                    if (!nguaTryLock()) return;
+                    vibrate(25);
+                    sendAction(actionBody("roll"), true);
+                }
+            });
+        } else if (gp.equals("pick") && myTurn) {
+            c.addView(centerText("Chọn ngựa để đi:", 17, C_MUTED, true), matchWrap(8));
+            JSONArray legal = jArr(g, "myLegal");
+            if (legal != null) {
+                for (int i = 0; i < legal.length(); i++) {
+                    JSONObject le = legal.optJSONObject(i);
+                    if (le == null) continue;
+                    final int horse = jInt(le, "horse", -1);
+                    if (horse < 0) continue;
+                    Button b = bigButton("🐴 Ngựa " + (horse + 1) + " — " + jStr(le, "hint", ""),
+                        Color.parseColor("#92400E"), Color.parseColor("#FFC93D"), 18);
+                    c.addView(b, lp(ViewGroup.LayoutParams.MATCH_PARENT, dp(58), 8));
+                    fireOnDown(b, new Runnable() {
+                        @Override public void run() {
+                            if (!nguaTryLock()) return;
+                            JSONObject bdy = actionBody("move");
+                            try { bdy.put("horse", horse); } catch (Exception ignored) { }
+                            vibrate(25);
+                            sendAction(bdy, true);
+                        }
+                    });
+                }
+            }
+        } else {
+            JSONArray log = jArr(g, "log");
+            if (log != null && log.length() > 0) {
+                for (int i = log.length() - 1; i >= Math.max(0, log.length() - 2); i--) {
+                    c.addView(centerText(log.optString(i, ""), 15,
+                        i == log.length() - 1 ? C_TEXT : C_MUTED, false), matchWrap(4));
+                }
+            } else {
+                c.addView(centerText("Đợi người chơi khác…", 15, C_MUTED, false), matchWrap(6));
+            }
+        }
+        JSONArray ps = jArr(v, "players");
+        if (ps != null) {
+            LinearLayout rows = col();
+            for (int i = 0; i < ps.length(); i++) {
+                JSONObject p = ps.optJSONObject(i);
+                if (p == null) continue;
+                int seat = jInt(p, "seat", -1);
+                TextView row = text("🐴 " + jStr(p, "name", "") + " — về chuồng " + nguaHome(horses, seat) + "/4",
+                    15, seat == sSeat ? accent() : C_MUTED, seat == sSeat);
+                rows.addView(row, matchWrap(3));
+            }
+            ScrollView sv = new ScrollView(this);
+            sv.addView(rows);
+            LinearLayout.LayoutParams svp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f);
+            svp.topMargin = dp(10);
+            c.addView(sv, svp);
+        }
+        c.addView(timerLine("sec"), matchWrap(2));
+        return c;
+    }
+
+    // ---------- Đá Bóng Đầu To (versus: team soccer on the pad) ----------
+    private String soccerScoreText(JSONObject g) {
+        JSONObject sb = jObj(g, "scoreboard");
+        return "ĐỎ " + (sb == null ? 0 : jInt(sb, "do", 0))
+            + " — " + (sb == null ? 0 : jInt(sb, "xanh", 0)) + " XANH";
+    }
+
+    private LinearLayout soccerPad(JSONObject v, JSONObject g) {
+        clearPad(true); // a rebuilt screen must never inherit a stuck "held" bit
+        LinearLayout c = col();
+        c.setGravity(Gravity.CENTER_HORIZONTAL);
+        String gp = jStr(g, "phase", "");
+        if (!gp.equals("soccer") && !gp.equals("goal")) {
+            c.addView(centerText("Đợi vào sân…", 18, C_MUTED, false), matchWrap(30));
+            return c;
+        }
+        boolean red = jStr(g, "myTeam", "").equals("do");
+        TextView chip = centerText(red ? "🔴 BẠN Ở ĐỘI ĐỎ" : "🔵 BẠN Ở ĐỘI XANH", 17, Color.WHITE, true);
+        chip.setBackground(roundRect(red ? Color.parseColor("#B03030") : Color.parseColor("#2F7FBF"),
+            Color.WHITE, 16));
+        chip.setPadding(dp(16), dp(5), dp(16), dp(5));
+        LinearLayout.LayoutParams cp = new LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        cp.gravity = Gravity.CENTER_HORIZONTAL;
+        cp.topMargin = dp(4);
+        c.addView(chip, cp);
+        TextView score = centerText(soccerScoreText(g), 22, C_TEXT, true);
+        tvScoreLine = score;
+        c.addView(score, matchWrap(4));
+        if (gp.equals("goal")) {
+            JSONObject gi = jObj(g, "goalInfo");
+            String msg = "⚽ GÔÔÔL!";
+            if (gi != null) {
+                Object by = gi.opt("by");
+                String teamName = jStr(gi, "team", "").equals("do") ? "ĐỘI ĐỎ" : "ĐỘI XANH";
+                if (by instanceof Number) {
+                    msg += "\n" + playerName(v, ((Number) by).intValue())
+                        + (jBool(gi, "ownGoal", false) ? " đá phản lưới nhà! 😱" : " ghi bàn cho " + teamName + "!");
+                } else {
+                    msg += "\nVào rồi!";
+                }
+            }
+            c.addView(centerText(msg, 21, Color.parseColor("#FFC93D"), true), matchWrap(4));
+        }
+        addFlex(c);
+        LinearLayout.LayoutParams pr = matchWrap(4);
+        pr.gravity = Gravity.CENTER_HORIZONTAL;
+        c.addView(padCluster("A\nSÚT", "B\nLƯỚT", null, "Y\nNHẢY", 13, null), pr);
+        addHint(c, "A: SÚT · B: LƯỚT · Y/▲: NHẢY · Đưa bóng vào gôn đối thủ!");
+        c.addView(timerLine("sec"), matchWrap(2));
+        return c;
+    }
+
+    // ---------- Ếch Ộp Phiêu Lưu (co-op: swallow-carry platformer) ----------
+    // B and X both gulp/spit on the server (rising edge near a free,
+    // non-carrying teammate swallows; a second press while carrying
+    // spits). While swallowed this phone shows the in-belly card and no
+    // pad at all — the passenger frog has no movement of its own.
+    private String frogLineText(JSONObject g) {
+        String s = "Tim: " + hearts(Math.max(0, jInt(g, "hearts", 0)))
+            + " · Màn " + jInt(g, "chamber", 1) + "/" + jInt(g, "chambersTotal", 3)
+            + " · 🪰 " + jInt(g, "fliesEaten", 0) + "/" + jInt(g, "fliesTotal", 9);
+        if (jBool(g, "myDoor", false)) s += " · 🚪 Bạn đang ở cửa!";
+        return s;
+    }
+
+    private LinearLayout frogPad(JSONObject v, JSONObject g) {
+        clearPad(true); // a rebuilt screen must never inherit a stuck "held" bit
+        LinearLayout c = col();
+        c.setGravity(Gravity.CENTER_HORIZONTAL);
+        String gp = jStr(g, "phase", "");
+        if (!gp.equals("frog") && !gp.equals("frogClear")) {
+            c.addView(centerText("Đợi…", 18, C_MUTED, false), matchWrap(30));
+            return c;
+        }
+        TextView line = centerText(frogLineText(g), 17, C_TEXT, true);
+        tvFrogLine = line;
+        c.addView(line, matchWrap(4));
+        if (gp.equals("frogClear")) {
+            c.addView(centerText("🎉 QUA MÀN " + jInt(g, "chamber", 1) + "!", 30, C_GREEN, true), matchWrap(20));
+            c.addView(centerText("Chuẩn bị màn tiếp theo…", 16, C_MUTED, false), matchWrap(4));
+            return c;
+        }
+        String state = jStr(g, "myState", "free");
+        if (state.equals("in")) {
+            Object carrier = g.opt("myCarrierSeat");
+            c.addView(centerText("🐸 Bạn đang ở trong bụng "
+                + (carrier instanceof Number ? playerName(v, ((Number) carrier).intValue()) : "đồng đội")
+                + "!", 24, C_TEXT, true), matchWrap(24));
+            c.addView(centerText("Đợi bạn ấy vác qua đoạn khó rồi nhả ra nhé.", 16, C_MUTED, false), matchWrap(6));
+            return c;
+        }
+        if (state.equals("carry")) {
+            Object pas = g.opt("myPassengerSeat");
+            TextView chip = centerText("🐸 Đang vác "
+                + (pas instanceof Number ? playerName(v, ((Number) pas).intValue()) : "")
+                + " trong bụng", 16, Color.WHITE, true);
+            chip.setBackground(roundRect(Color.parseColor("#1E7A46"), Color.WHITE, 16));
+            chip.setPadding(dp(16), dp(5), dp(16), dp(5));
+            LinearLayout.LayoutParams cp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            cp.gravity = Gravity.CENTER_HORIZONTAL;
+            c.addView(chip, cp);
+        } else {
+            c.addView(centerText("🐸 Tự do", 15, C_MUTED, true), matchWrap(2));
+        }
+        addFlex(c);
+        LinearLayout.LayoutParams pr = matchWrap(4);
+        pr.gravity = Gravity.CENTER_HORIZONTAL;
+        c.addView(padCluster("A\nNHẢY", "B\nNUỐT / NHẢ", "X\nNUỐT / NHẢ", "Y\nNHẢY", 12, null), pr);
+        addHint(c, "Cạnh đồng đội bấm NUỐT/NHẢ để nuốt · Đang vác bấm lại để nhả ra");
+        c.addView(timerLine("sec"), matchWrap(2));
+        return c;
+    }
+
+    // ---------- Đại Bác Căn Góc (versus: turn-based artillery) ----------
+    // The aim screen is NOT a pad cluster: big angle/power/face readouts
+    // plus hold-to-repeat steppers that write through setAim (throttled
+    // to one send per ~120ms while held, plus a final send on release).
+    // Firing goes through the pad channel as a 200ms A pulse — the
+    // server reads the rising edge, and 200ms always spans at least one
+    // 125ms server tick, so the edge can never slip between samples.
+    private static String windText(int wind) {
+        if (wind == 0) return "💨 Gió lặng";
+        return wind > 0 ? "💨 Gió thổi sang PHẢI ▶ " + wind : "💨 Gió thổi sang TRÁI ◀ " + (-wind);
+    }
+
+    private boolean aimActive() {
+        if (view == null) return false;
+        JSONObject g = jObj(view, "game");
+        return g != null && jStr(g, "id", "").equals("can-goc")
+            && jStr(g, "phase", "").equals("aim") && jBool(g, "myTurn", false);
+    }
+
+    private void refreshAimReadouts() {
+        if (tvAimAngle != null) tvAimAngle.setText("Góc: " + aimAngle + "°");
+        if (tvAimPower != null) tvAimPower.setText("Lực: " + aimPower);
+        if (tvAimFace != null) tvAimFace.setText(aimFace > 0 ? "Hướng: ▶ PHẢI" : "Hướng: ◀ TRÁI");
+    }
+
+    private void aimSend(boolean force) {
+        if (!aimActive()) return;
+        long now = System.currentTimeMillis();
+        if (!force && now - aimLastSentAt < 120) {
+            if (!aimFlushScheduled) {
+                aimFlushScheduled = true;
+                ui.postDelayed(new Runnable() {
+                    @Override public void run() {
+                        aimFlushScheduled = false;
+                        aimSend(true);
+                    }
+                }, 120);
+            }
+            return;
+        }
+        aimLastSentAt = now;
+        JSONObject b = actionBody("setAim");
+        try {
+            b.put("angle", aimAngle);
+            b.put("power", aimPower);
+            b.put("face", aimFace);
+        } catch (Exception ignored) { }
+        sendAction(b, false);
+    }
+
+    private void aimStep(int field, int delta) {
+        if (field == 0) aimAngle = Math.max(5, Math.min(85, aimAngle + delta));
+        else aimPower = Math.max(0, Math.min(100, aimPower + delta));
+        refreshAimReadouts();
+        aimSend(false);
+    }
+
+    /** Hold-to-repeat stepper: one step on touch-down, then one step
+     *  per ~60ms while held; the final value is force-sent on release. */
+    private void attachHoldStepper(Button b, final int field, final int delta) {
+        b.setOnTouchListener(new View.OnTouchListener() {
+            private Runnable rep;
+            @Override public boolean onTouch(View vw, MotionEvent ev) {
+                int a = ev.getActionMasked();
+                if (a == MotionEvent.ACTION_DOWN) {
+                    vw.setScaleX(0.94f); vw.setScaleY(0.94f);
+                    if (vw.getParent() != null) vw.getParent().requestDisallowInterceptTouchEvent(true);
+                    final int gen = aimGen;
+                    aimHoldCount++;
+                    aimStep(field, delta);
+                    rep = new Runnable() {
+                        @Override public void run() {
+                            if (gen != aimGen || !aimActive()) return;
+                            aimStep(field, delta);
+                            if (aimHoldCount > 0) ui.postDelayed(this, 60);
+                        }
+                    };
+                    ui.postDelayed(rep, 60);
+                } else if (a == MotionEvent.ACTION_UP || a == MotionEvent.ACTION_CANCEL) {
+                    vw.setScaleX(1f); vw.setScaleY(1f);
+                    if (rep != null) { ui.removeCallbacks(rep); rep = null; }
+                    if (aimHoldCount > 0) aimHoldCount--;
+                    aimSend(true);
+                }
+                return true;
+            }
+        });
+    }
+
+    /** Fire: one A pulse on the pad channel (rising edge fires). */
+    private void fireCannon() {
+        if (padState[B_A]) return;
+        padState[B_A] = true;
+        onPadChanged();
+        ui.postDelayed(new Runnable() {
+            @Override public void run() {
+                if (padState[B_A]) {
+                    padState[B_A] = false;
+                    onPadChanged();
+                }
+            }
+        }, 200);
+    }
+
+    private void addCannonList(LinearLayout c, JSONObject v, JSONObject g) {
+        JSONObject cannons = jObj(g, "cannons");
+        JSONArray ps = jArr(v, "players");
+        if (cannons == null || ps == null) return;
+        for (int i = 0; i < ps.length(); i++) {
+            JSONObject p = ps.optJSONObject(i);
+            if (p == null) continue;
+            int seat = jInt(p, "seat", -1);
+            JSONObject cn = jObj(cannons, String.valueOf(seat));
+            if (cn == null) continue;
+            boolean alive = jBool(cn, "alive", true);
+            int hp = jInt(cn, "hp", 0);
+            Integer pc = SEAT_HEX.get(jStr(p, "color", "blue"));
+            TextView row = text((alive ? "🟢 " : "💀 ") + jStr(p, "name", "") + (seat == sSeat ? " (bạn)" : "")
+                + " — " + (alive ? hp + " HP" : "đã bị phá huỷ"), 16, seat == sSeat ? accent() : C_TEXT, seat == sSeat);
+            row.setBackground(roundRect(C_PANEL2, pc != null ? pc : C_MUTED, 12));
+            row.setPadding(dp(12), dp(6), dp(12), dp(6));
+            c.addView(row, matchWrap(5));
+        }
+    }
+
+    private LinearLayout cannonAim(JSONObject v, JSONObject g) {
+        LinearLayout c = col();
+        c.setGravity(Gravity.CENTER_HORIZONTAL);
+        String gp = jStr(g, "phase", "");
+        int wind = jInt(g, "wind", 0);
+        JSONObject mc = jObj(g, "myCannon");
+        boolean myTurn = jBool(g, "myTurn", false);
+        if (gp.equals("shell")) {
+            c.addView(centerText("🚀 ĐẠN ĐANG BAY…", 30, C_TEXT, true), matchWrap(40));
+            c.addView(centerText(windText(wind), 16, C_MUTED, false), matchWrap(6));
+            return c;
+        }
+        if (gp.equals("boom")) {
+            c.addView(centerText("💥 BÙM!", 40, C_RED, true), matchWrap(30));
+            JSONObject boom = jObj(g, "boom");
+            JSONObject hits = boom == null ? null : jObj(boom, "hits");
+            if (hits != null) {
+                Iterator<String> kit = hits.keys();
+                while (kit.hasNext()) {
+                    String ks = kit.next();
+                    int seat = -1;
+                    try { seat = Integer.parseInt(ks); } catch (Exception ignored) { }
+                    if (seat < 0) continue;
+                    c.addView(centerText(playerName(v, seat) + " trúng đạn −" + hits.optInt(ks, 0) + " HP",
+                        17, C_TEXT, false), matchWrap(4));
+                }
+            }
+            return c;
+        }
+        if (!gp.equals("aim")) {
+            c.addView(centerText("Đợi…", 18, C_MUTED, false), matchWrap(30));
+            return c;
+        }
+        if (mc != null && !jBool(mc, "alive", true)) {
+            c.addView(centerText("💥 Pháo của bạn đã bị phá huỷ!", 24, C_RED, true), matchWrap(24));
+            c.addView(centerText("Xem TV đợi kết quả nhé…", 15, C_MUTED, false), matchWrap(4));
+            addCannonList(c, v, g);
+            return c;
+        }
+        if (!myTurn) {
+            int turn = jInt(g, "turn", -1);
+            c.addView(centerText("Lượt của " + playerName(v, turn), 24, C_TEXT, true), matchWrap(10));
+            c.addView(centerText(windText(wind), 17, C_MUTED, true), matchWrap(2));
+            LinearLayout rows = col();
+            addCannonList(rows, v, g);
+            ScrollView sv = new ScrollView(this);
+            sv.addView(rows);
+            LinearLayout.LayoutParams svp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f);
+            svp.topMargin = dp(8);
+            c.addView(sv, svp);
+            c.addView(centerText("Đợi tới lượt của bạn để căn góc…", 14, C_MUTED, false), matchWrap(6));
+            return c;
+        }
+        // My turn: seed the local aim from the server's cannon once per
+        // aim phase (endsAt is unique per turn); after that the steppers
+        // own the locals and updateDynamic only re-syncs between holds.
+        long endsAt = jLong(g, "endsAt", 0);
+        if (mc != null && aimForEndsAt != endsAt) {
+            aimForEndsAt = endsAt;
+            aimAngle = (int) Math.round(jDouble(mc, "angle", 45));
+            aimPower = jInt(mc, "power", 60);
+            int f = jInt(mc, "face", 1);
+            aimFace = f == 0 ? 1 : f;
+        }
+        c.addView(centerText("🎯 TỚI LƯỢT BẠN — CĂN GÓC ĐI!", 20, Color.parseColor("#FFC93D"), true), matchWrap(2));
+        c.addView(centerText(windText(wind) + (mc != null ? " · Pháo của bạn: " + jInt(mc, "hp", 0) + " HP" : ""),
+            15, C_MUTED, true), matchWrap(2));
+
+        LinearLayout reads = new LinearLayout(this);
+        reads.setOrientation(LinearLayout.HORIZONTAL);
+        reads.setGravity(Gravity.CENTER);
+        tvAimAngle = centerText("", 25, C_TEXT, true);
+        tvAimPower = centerText("", 25, C_TEXT, true);
+        tvAimFace = centerText("", 19, accent(), true);
+        reads.addView(tvAimAngle, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        reads.addView(tvAimPower, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        reads.addView(tvAimFace, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        c.addView(reads, matchWrap(8));
+        refreshAimReadouts();
+
+        String[][] steppers = {
+            { "− GÓC", "0", "-1" }, { "GÓC +", "0", "1" },
+            { "− LỰC", "1", "-1" }, { "LỰC +", "1", "1" } };
+        for (int r = 0; r < 2; r++) {
+            LinearLayout rowL = new LinearLayout(this);
+            rowL.setOrientation(LinearLayout.HORIZONTAL);
+            for (int k = 0; k < 2; k++) {
+                String[] s = steppers[r * 2 + k];
+                Button b = bigButton(s[0], C_PANEL2, accent(), 21);
+                LinearLayout.LayoutParams bp = new LinearLayout.LayoutParams(0, dp(64), 1f);
+                if (k == 1) bp.leftMargin = dp(10);
+                rowL.addView(b, bp);
+                attachHoldStepper(b, Integer.parseInt(s[1]), Integer.parseInt(s[2]));
+            }
+            c.addView(rowL, matchWrap(r == 0 ? 10 : 8));
+        }
+
+        Button flip = bigButton("⇋ ĐỔI HƯỚNG", Color.parseColor("#2F7FBF"), Color.parseColor("#6DB6F2"), 19);
+        c.addView(flip, lp(ViewGroup.LayoutParams.MATCH_PARENT, dp(54), 10));
+        fireOnDown(flip, new Runnable() {
+            @Override public void run() {
+                aimFace = -aimFace;
+                refreshAimReadouts();
+                aimSend(true);
+            }
+        });
+
+        Button fire = bigButton("🔥 BẮN", Color.parseColor("#B03030"), Color.parseColor("#FF6B6B"), 30);
+        c.addView(fire, lp(ViewGroup.LayoutParams.MATCH_PARENT, dp(84), 12));
+        fireOnDown(fire, new Runnable() {
+            @Override public void run() {
+                vibrate(40);
+                fireCannon();
+            }
+        });
+        c.addView(timerLine("sec"), matchWrap(4));
         return c;
     }
 }
