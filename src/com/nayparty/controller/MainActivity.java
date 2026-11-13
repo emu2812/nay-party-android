@@ -13,6 +13,7 @@ import android.os.Looper;
 import android.os.Vibrator;
 import android.text.InputType;
 import android.text.TextUtils;
+import android.util.Base64;
 import android.util.DisplayMetrics;
 import android.util.TypedValue;
 import android.view.Gravity;
@@ -32,13 +33,18 @@ import android.widget.Toast;
 import org.json.JSONArray;
 import org.json.JSONObject;
 
+import java.io.BufferedInputStream;
 import java.io.BufferedReader;
+import java.io.ByteArrayOutputStream;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.net.HttpURLConnection;
+import java.net.Socket;
 import java.net.URL;
 import java.nio.charset.Charset;
+import java.security.MessageDigest;
+import java.security.SecureRandom;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -48,6 +54,9 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.zip.GZIPInputStream;
 
+import javax.net.ssl.SSLSocket;
+import javax.net.ssl.SSLSocketFactory;
+
 /**
  * Nảy Party — Tay cầm (native Android controller).
  *
@@ -55,8 +64,12 @@ import java.util.zip.GZIPInputStream;
  *   POST /api/rooms/:code/join    {name}                  -> {seat, playerToken, color}
  *   GET  /api/rooms/:code/state?role=player&token=...     -> filtered player view
  *   POST /api/rooms/:code/action  {role, token, action..} -> updated player view
+ *   WSS  /api/rooms/:code/ws?role=player&token=...        -> primary channel while
+ *        connected: pushes {"type":"state","view":...} and carries the same
+ *        action objects as frames; HTTP stays as the automatic fallback.
  *
- * Pure framework code (org.json ships with Android), zero external deps.
+ * Pure framework code (org.json ships with Android), zero external deps —
+ * the WebSocket client below is hand-rolled on a raw TLS socket (RFC 6455).
  */
 public class MainActivity extends Activity {
 
@@ -109,6 +122,32 @@ public class MainActivity extends Activity {
     private int netFailCount = 0;
     private boolean destroyed = false;
     private int actSeq = 0;
+    private long lastViewServerNow = 0; // serverNow of the last applied view (cross-channel staleness guard)
+
+    // ---- WebSocket transport ----
+    // Primary channel while open; every send path checks wsOpen and falls
+    // back to the exact v1.4 HTTP code when it is down. State machine:
+    //   wsWanted (in a room session) + !wsSuspended (activity foreground)
+    //   gate wsEnsure(), which starts one connect attempt per wsGen.
+    //   A death (EOF / IO error / failed handshake) runs wsOnDown(gen),
+    //   which schedules the next wsEnsure() with backoff 1s->2s->5s->10s.
+    //   A server {"type":"bye"} closes the socket and suppresses attempts
+    //   until wsSuppressUntil (10s) or the next user action (wsKick()).
+    private static final String WS_HOST = "nay-party.nguyenhailinh140101.workers.dev";
+    private static final long[] WS_BACKOFF = { 1000, 2000, 5000, 10000 };
+    private static final SecureRandom WS_RNG = new SecureRandom();
+    private final ExecutorService wsExec = Executors.newSingleThreadExecutor();
+    private final Object wsWriteLock = new Object();
+    private volatile boolean wsOpen = false;
+    private volatile boolean wsConnecting = false;
+    private volatile boolean wsSuspended = false; // activity paused
+    private volatile Socket wsSocket;
+    private volatile OutputStream wsOut;
+    private volatile int wsGen = 0;
+    private int wsDownGen = -1;         // last generation whose death was handled
+    private int wsBackoffIdx = 0;
+    private boolean wsWanted = false;   // in a room session (enterRoom/leaveRoom)
+    private long wsSuppressUntil = 0;   // after "bye": no reconnect before this time
 
     // ---- view state ----
     private JSONObject view;            // last player view from the server
@@ -172,6 +211,8 @@ public class MainActivity extends Activity {
             getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
             showRoomShell("Đang nối lại phòng " + sCode + "…");
             startPolling();
+            wsWanted = true;
+            wsEnsure();
         } else {
             showJoin(null);
         }
@@ -191,12 +232,20 @@ public class MainActivity extends Activity {
         clearPad(true);
         // Stop polling while backgrounded; onResume restarts it.
         stopPolling();
+        // Same for the socket: close it while backgrounded (wsSuspended
+        // blocks the reader's reconnect scheduling); onResume reopens.
+        wsSuspended = true;
+        wsCloseNow();
     }
 
     @Override
     protected void onResume() {
         super.onResume();
-        if (inRoom && !destroyed) startPolling();
+        wsSuspended = false;
+        if (inRoom && !destroyed) {
+            startPolling();
+            wsEnsure();
+        }
     }
 
     @Override
@@ -204,9 +253,12 @@ public class MainActivity extends Activity {
         destroyed = true;
         inRoom = false;
         stopPolling();
+        wsWanted = false;
+        wsCloseNow();
         padExec.shutdownNow();
         actExec.shutdownNow();
         pollExec.shutdownNow();
+        wsExec.shutdownNow();
         super.onDestroy();
     }
 
@@ -478,21 +530,32 @@ public class MainActivity extends Activity {
         netFailCount = 0;
         view = null;
         currentSig = "";
+        lastViewServerNow = 0;
         prevGameId = ""; prevMyLives = null; prevMyAlive = null; lastVibKey = "";
         lockKey = ""; guessEntry = ""; inputCtx = "";
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         showRoomShell("Đang nối phòng " + sCode + "…");
         startPolling();
+        // Open the WebSocket: it becomes the primary channel as soon as
+        // the handshake lands; until then (and whenever it is down) the
+        // HTTP poll below runs at full speed.
+        wsWanted = true;
+        wsBackoffIdx = 0;
+        wsSuppressUntil = 0;
+        wsEnsure();
     }
 
     private void leaveRoom(String message) {
         clearPad(true); // send the reset while the session is still live
+        wsWanted = false;
+        wsCloseNow();
         inRoom = false;
         pollRunning = false;
         pollGen++;
         clearToken();
         view = null;
         currentSig = "";
+        lastViewServerNow = 0;
         getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         showJoin(message);
     }
@@ -586,7 +649,7 @@ public class MainActivity extends Activity {
                         handlePoll(fr, fe);
                         ui.postDelayed(new Runnable() {
                             @Override public void run() { pollOnce(gen); }
-                        }, 250);
+                        }, wsOpen ? 2000 : 250);
                     }
                 });
             }
@@ -620,6 +683,12 @@ public class MainActivity extends Activity {
 
     /** Fire-and-forget gameplay action; a successful response doubles as a fresh view. */
     private void sendAction(final JSONObject body, final boolean useResponse) {
+        // A user action also ends a server-"bye" suppression window.
+        wsKick();
+        // WS fast path: frames carry the bare action object — identity
+        // comes from the upgrade URL, so NO role/token fields are added.
+        // No per-action response exists on WS; state arrives as pushes.
+        if (wsSendText(body.toString())) return;
         try {
             body.put("role", "player");
             body.put("token", sToken);
@@ -669,6 +738,18 @@ public class MainActivity extends Activity {
     private boolean padDrainScheduled = false;
 
     private void sendPadSnapshot(final JSONObject pad) {
+        // A pad change is a user action: it ends a "bye" suppression.
+        wsKick();
+        if (wsOpen) {
+            // WS path: absolute-state frames over one ordered TCP stream
+            // need no coalescing — each snapshot goes out as it happens.
+            // Drop anything still queued for HTTP: those snapshots predate
+            // the socket, and the connect sync (plus this frame) already
+            // carries newer state.
+            synchronized (padSlotLock) { pendingPad = null; }
+            wsSendText(padFrame(pad).toString());
+            return;
+        }
         synchronized (padSlotLock) {
             pendingPad = pad;
             if (padDrainScheduled) return;
@@ -684,6 +765,11 @@ public class MainActivity extends Activity {
                             pendingPad = null;
                             if (p == null) { padDrainScheduled = false; return; }
                         }
+                        // The socket came up while this snapshot waited:
+                        // it is stale by construction (the connect sync
+                        // and direct WS frames carry newer state) — drop
+                        // it instead of letting HTTP overwrite the pad.
+                        if (wsOpen) continue;
                         postPadSync(p);
                     }
                 }
@@ -716,20 +802,40 @@ public class MainActivity extends Activity {
 
     /** Kéo Co: one press = rising edge of B, then release — strictly ordered on the pad channel. */
     private void sendTugPress() {
+        wsKick();
+        final JSONObject on = new JSONObject();
+        final JSONObject off = new JSONObject();
+        try {
+            for (int i = 0; i < 6; i++) { on.put(PAD_KEYS[i], i == B_B); off.put(PAD_KEYS[i], false); }
+        } catch (Exception ignored) { }
+        if (wsOpen) {
+            // Same press, as two frames: the single ordered wsExec queue
+            // (and TCP under it) keeps on-before-off, like the HTTP posts.
+            wsSendText(padFrame(on).toString());
+            wsSendText(padFrame(off).toString());
+            return;
+        }
         padExec.execute(new Runnable() {
             @Override public void run() {
-                JSONObject on = new JSONObject();
-                JSONObject off = new JSONObject();
-                try {
-                    for (int i = 0; i < 6; i++) { on.put(PAD_KEYS[i], i == B_B); off.put(PAD_KEYS[i], false); }
-                } catch (Exception ignored) { }
                 postPadSync(on);
                 postPadSync(off);
             }
         });
     }
 
+    /** One pad action object (identity lives in the channel, not the body). */
+    private JSONObject padFrame(JSONObject pad) {
+        JSONObject b = actionBody("pad");
+        try { b.put("pad", pad); } catch (Exception ignored) { }
+        return b;
+    }
+
     private void postPadSync(JSONObject pad) {
+        // Deliberately NOT re-routed when the socket opens mid-flight:
+        // this is the tail of an ordered HTTP sequence (a Kéo Co on/off
+        // pair, or the drain), and finishing it on the same channel keeps
+        // its internal order absolute. Fresh input never starts here —
+        // sendPadSnapshot/sendTugPress pick the channel once, up front.
         JSONObject b = actionBody("pad");
         try {
             b.put("role", "player");
@@ -740,12 +846,359 @@ public class MainActivity extends Activity {
         catch (Exception ignored) { }
     }
 
+    // ======================= WebSocket transport =======================
+    // Hand-rolled RFC 6455 client on a raw TLS socket (no external deps).
+    // Threading: ONE reader thread per connection parses frames and posts
+    // decoded messages to the UI thread; ALL client->server frames are
+    // written by tasks on the single-thread wsExec queue, so text sends
+    // stay in submission order (tug on/off pairs included). The reader
+    // thread's pongs bypass the queue but share wsWriteLock with the
+    // queued writes, so bytes from the two writers can never interleave
+    // mid-frame. A connection is identified by its wsGen; any callback
+    // carrying a stale gen is a no-op, which keeps teardown race-free.
+
+    /** Start a connect attempt if one is due. Safe to call from anywhere. */
+    private void wsEnsure() {
+        if (destroyed || !wsWanted || wsSuspended || wsOpen || wsConnecting) return;
+        long nowMs = System.currentTimeMillis();
+        if (nowMs < wsSuppressUntil) {
+            // Server said "bye": wait out the window, then retry on our own.
+            final int gen = wsGen;
+            ui.postDelayed(new Runnable() {
+                @Override public void run() { if (gen == wsGen) wsEnsure(); }
+            }, wsSuppressUntil - nowMs + 50);
+            return;
+        }
+        wsConnecting = true;
+        final int gen = ++wsGen;
+        try {
+            wsExec.execute(new Runnable() {
+                @Override public void run() { wsConnect(gen); }
+            });
+        } catch (RuntimeException e) {
+            wsConnecting = false; // executor shut down (onDestroy race)
+        }
+    }
+
+    /** A user action ends a "bye" suppression immediately, then reconnects. */
+    private void wsKick() {
+        if (wsSuppressUntil > 0) wsSuppressUntil = 0;
+        wsEnsure();
+    }
+
+    /** Full teardown: invalidate the generation, close the socket. */
+    private void wsCloseNow() {
+        wsGen++;
+        wsOpen = false;
+        wsConnecting = false;
+        Socket s = wsSocket;
+        wsSocket = null;
+        wsOut = null;
+        closeQuietly(s);
+    }
+
+    private static void closeQuietly(Socket s) {
+        if (s == null) return;
+        try { s.close(); } catch (Exception ignored) { }
+    }
+
+    /** One connection died (EOF, IO error, or a failed handshake). */
+    private void wsOnDown(int gen) {
+        if (gen != wsGen || gen == wsDownGen) return; // stale or already handled
+        wsDownGen = gen;
+        wsOpen = false;
+        wsConnecting = false;
+        Socket s = wsSocket;
+        wsSocket = null;
+        wsOut = null;
+        closeQuietly(s);
+        if (destroyed || !wsWanted || wsSuspended) return;
+        long delay = WS_BACKOFF[Math.min(wsBackoffIdx, WS_BACKOFF.length - 1)];
+        if (wsBackoffIdx < WS_BACKOFF.length - 1) wsBackoffIdx++;
+        final int g = gen;
+        ui.postDelayed(new Runnable() {
+            @Override public void run() { if (g == wsGen) wsEnsure(); }
+        }, delay);
+    }
+
+    /** Connect + HTTP upgrade handshake. Runs on wsExec. */
+    private void wsConnect(final int gen) {
+        Socket sock = null;
+        try {
+            sock = SSLSocketFactory.getDefault().createSocket(WS_HOST, 443);
+            wsSocket = sock; // lets wsCloseNow abort a stuck handshake
+            sock.setSoTimeout(10000);
+            ((SSLSocket) sock).startHandshake();
+
+            byte[] keyBytes = new byte[16];
+            WS_RNG.nextBytes(keyBytes);
+            String key = Base64.encodeToString(keyBytes, Base64.NO_WRAP);
+            String path = "/api/rooms/" + sCode + "/ws?role=player&token="
+                + java.net.URLEncoder.encode(sToken, "UTF-8");
+            String req = "GET " + path + " HTTP/1.1\r\n"
+                + "Host: " + WS_HOST + "\r\n"
+                + "Upgrade: websocket\r\n"
+                + "Connection: Upgrade\r\n"
+                + "Sec-WebSocket-Key: " + key + "\r\n"
+                + "Sec-WebSocket-Version: 13\r\n"
+                + "\r\n";
+            OutputStream out = sock.getOutputStream();
+            out.write(req.getBytes("ISO-8859-1"));
+            out.flush();
+
+            // The same buffered stream feeds the frame reader afterwards,
+            // so bytes the server pipelined past the header block survive.
+            BufferedInputStream in = new BufferedInputStream(sock.getInputStream(), 8192);
+            String headers = wsReadHeaders(in);
+            if (!wsHandshakeOk(headers, key)) throw new Exception("upgrade rejected");
+
+            if (gen != wsGen || destroyed || !wsWanted || wsSuspended) {
+                // Torn down (or backgrounded) while handshaking: the fresh
+                // socket is useless — drop it; wsOnDown clears the flags.
+                closeQuietly(sock);
+                wsOnDown(gen);
+                return;
+            }
+            sock.setSoTimeout(0);
+            wsOut = out;
+            wsOpen = true;
+            wsConnecting = false;
+            wsBackoffIdx = 0;
+            final BufferedInputStream fin = in;
+            Thread reader = new Thread(new Runnable() {
+                @Override public void run() { wsReadLoop(gen, fin); }
+            }, "np-ws-reader");
+            reader.setDaemon(true);
+            reader.start();
+            // Sync the current pad state over the fresh socket, so input
+            // state on the server matches the fingers from frame one.
+            if (view != null && "playing".equals(jStr(view, "phase", ""))) {
+                wsSendText(padFrame(padJson()).toString());
+            }
+        } catch (Exception e) {
+            closeQuietly(sock);
+            if (wsSocket == sock) wsSocket = null;
+            wsOnDown(gen); // failed handshake counts as down: backoff + HTTP fallback
+        }
+    }
+
+    /** Read an HTTP header block (up to \r\n\r\n) off the upgrade response. */
+    private static String wsReadHeaders(BufferedInputStream in) throws Exception {
+        ByteArrayOutputStream buf = new ByteArrayOutputStream();
+        final byte[] end = { '\r', '\n', '\r', '\n' };
+        int matched = 0;
+        int b;
+        while ((b = in.read()) >= 0) {
+            buf.write(b);
+            if (buf.size() > 16384) throw new Exception("headers too large");
+            if (b == end[matched]) {
+                matched++;
+                if (matched == 4) return new String(buf.toByteArray(), "ISO-8859-1");
+            } else {
+                matched = (b == '\r') ? 1 : 0;
+            }
+        }
+        throw new Exception("eof during handshake");
+    }
+
+    /** Validate the 101 and, when present, the Sec-WebSocket-Accept hash. */
+    private static boolean wsHandshakeOk(String headers, String key) {
+        int eol = headers.indexOf("\r\n");
+        String statusLine = eol >= 0 ? headers.substring(0, eol) : headers;
+        if (!statusLine.contains(" 101")) return false;
+        String accept = null;
+        String[] lines = headers.split("\r\n");
+        for (int i = 1; i < lines.length; i++) {
+            int colon = lines[i].indexOf(':');
+            if (colon > 0 && lines[i].substring(0, colon).trim().equalsIgnoreCase("sec-websocket-accept")) {
+                accept = lines[i].substring(colon + 1).trim();
+            }
+        }
+        if (accept == null) return true; // 101 verified; accept is a "when present" check
+        try {
+            MessageDigest sha1 = MessageDigest.getInstance("SHA-1");
+            String expect = Base64.encodeToString(
+                sha1.digest((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").getBytes("ISO-8859-1")),
+                Base64.NO_WRAP);
+            return expect.equals(accept);
+        } catch (Exception e) {
+            return true; // never block a 101 on local crypto trouble
+        }
+    }
+
+    /**
+     * Queue one text frame for sending. Returns false (caller falls back
+     * to HTTP) when the socket is down or the queue is gone. Fire-and-
+     * forget once queued: a failed write tears the connection down via
+     * wsOnDown, and the surviving HTTP poll keeps the game playable.
+     */
+    private boolean wsSendText(final String text) {
+        if (!wsOpen) return false;
+        final int gen = wsGen;
+        try {
+            wsExec.execute(new Runnable() {
+                @Override public void run() {
+                    try { wsWriteFrame(0x1, text.getBytes("UTF-8")); }
+                    catch (Exception e) { wsOnDown(gen); }
+                }
+            });
+            return true;
+        } catch (RuntimeException e) {
+            return false; // executor shut down: HTTP fallback takes it
+        }
+    }
+
+    /** Serialize one masked client frame and write it under the write lock. */
+    private void wsWriteFrame(int opcode, byte[] payload) throws Exception {
+        OutputStream out = wsOut;
+        if (out == null) throw new Exception("ws not open");
+        int len = payload.length;
+        ByteArrayOutputStream frame = new ByteArrayOutputStream(len + 14);
+        frame.write(0x80 | opcode); // FIN + opcode
+        if (len < 126) {
+            frame.write(0x80 | len);
+        } else if (len <= 0xFFFF) {
+            frame.write(0x80 | 126);
+            frame.write((len >> 8) & 0xFF);
+            frame.write(len & 0xFF);
+        } else {
+            frame.write(0x80 | 127);
+            for (int i = 7; i >= 0; i--) frame.write((int) ((len >> (8 * i)) & 0xFF));
+        }
+        byte[] mask = new byte[4];
+        WS_RNG.nextBytes(mask);
+        frame.write(mask, 0, 4);
+        for (int i = 0; i < len; i++) frame.write(payload[i] ^ mask[i & 3]);
+        byte[] bytes = frame.toByteArray();
+        synchronized (wsWriteLock) {
+            out.write(bytes);
+            out.flush();
+        }
+    }
+
+    private static int wsReadByte(InputStream in) throws Exception {
+        int b = in.read();
+        if (b < 0) throw new Exception("eof");
+        return b;
+    }
+
+    private static void wsReadFully(InputStream in, byte[] buf, int off, int len) throws Exception {
+        int n = 0;
+        while (n < len) {
+            int r = in.read(buf, off + n, len - n);
+            if (r < 0) throw new Exception("eof");
+            n += r;
+        }
+    }
+
+    /** Frame reader: runs on its own thread for the life of one connection. */
+    private void wsReadLoop(final int gen, BufferedInputStream in) {
+        ByteArrayOutputStream frag = null;
+        boolean fragIsText = false;
+        try {
+            for (;;) {
+                int b0 = wsReadByte(in);
+                int b1 = wsReadByte(in);
+                boolean fin = (b0 & 0x80) != 0;
+                int op = b0 & 0x0F;
+                boolean masked = (b1 & 0x80) != 0;
+                long len = b1 & 0x7F;
+                if (len == 126) {
+                    len = (wsReadByte(in) << 8) | wsReadByte(in);
+                } else if (len == 127) {
+                    len = 0;
+                    for (int i = 0; i < 8; i++) len = (len << 8) | wsReadByte(in);
+                }
+                if (len < 0 || len > (1 << 20)) throw new Exception("oversized frame");
+                byte[] mask = null;
+                if (masked) { // servers don't mask, but parse it if one does
+                    mask = new byte[4];
+                    wsReadFully(in, mask, 0, 4);
+                }
+                byte[] payload = new byte[(int) len];
+                wsReadFully(in, payload, 0, (int) len);
+                if (mask != null) for (int i = 0; i < payload.length; i++) payload[i] ^= mask[i & 3];
+
+                if (op == 0x9) {          // ping -> pong with the same payload
+                    try { wsWriteFrame(0xA, payload); } catch (Exception ignored) { }
+                    continue;
+                }
+                if (op == 0xA) continue;  // pong: nothing to do
+                if (op == 0x8) {          // close: answer once, then hang up
+                    try { wsWriteFrame(0x8, new byte[0]); } catch (Exception ignored) { }
+                    throw new Exception("server closed");
+                }
+                if (op == 0x1 || op == 0x2) {
+                    frag = new ByteArrayOutputStream();
+                    fragIsText = (op == 0x1);
+                    frag.write(payload, 0, payload.length);
+                } else if (op == 0x0) {
+                    if (frag == null) continue; // stray continuation
+                    frag.write(payload, 0, payload.length);
+                } else {
+                    continue; // unknown opcode: skip the frame
+                }
+                if (fin && frag != null) {
+                    byte[] msg = frag.toByteArray();
+                    boolean isText = fragIsText;
+                    frag = null;
+                    if (isText) wsOnMessage(new String(msg, "UTF-8"));
+                }
+            }
+        } catch (Exception ignored) { }
+        wsOnDown(gen);
+    }
+
+    /** Dispatch one decoded server message. Runs on the reader thread. */
+    private void wsOnMessage(String text) {
+        JSONObject o;
+        try { o = new JSONObject(text); } catch (Exception e) { return; }
+        String type = jStr(o, "type", "");
+        if (type.equals("state")) {
+            final JSONObject v = jObj(o, "view");
+            if (v == null) return;
+            // Exactly the poll path: same applyView, same guards.
+            ui.post(new Runnable() {
+                @Override public void run() {
+                    if (destroyed || !inRoom) return;
+                    netFailCount = 0;
+                    applyView(v);
+                }
+            });
+        } else if (type.equals("error")) {
+            final String error = jStr(o, "error", "");
+            if (error.length() == 0) return;
+            // Same surface as an HTTP action error (sendAction's toast).
+            ui.post(new Runnable() {
+                @Override public void run() {
+                    if (destroyed || !inRoom) return;
+                    if (!error.equals("Chưa vào game.")) toast(error);
+                }
+            });
+        } else if (type.equals("bye")) {
+            // Fatal on the server side: drop to HTTP and don't spin —
+            // reconnect attempts stay suppressed for 10s or until the
+            // next user action (wsKick). Closing just the socket routes
+            // the teardown through the normal wsOnDown path.
+            wsSuppressUntil = System.currentTimeMillis() + 10000;
+            closeQuietly(wsSocket);
+        }
+    }
+
     // ======================= view handling =======================
 
     private long estServerNow() { return System.currentTimeMillis() + serverOffset; }
 
     private void applyView(JSONObject v) {
         if (destroyed) return;
+        // Cross-channel staleness guard: with WS pushing state AND the
+        // HTTP safety-net poll answering in parallel, a slow poll response
+        // can land after a fresher pushed view. serverNow orders them —
+        // a view older than the last applied one is dropped whole (equal
+        // timestamps still apply: re-applying is a no-op by signature,
+        // and onConfigurationChanged re-applies the current view).
+        long snIn = jLong(v, "serverNow", 0);
+        if (snIn > 0 && lastViewServerNow > 0 && snIn < lastViewServerNow) return;
         view = v;
         // Match boundary: a new match reuses the same gameId:round keys, so
         // a local input lock (or a half-typed guess) from the PREVIOUS match
@@ -764,7 +1217,10 @@ public class MainActivity extends Activity {
             }
         }
         long sn = jLong(v, "serverNow", 0);
-        if (sn > 0) serverOffset = sn - System.currentTimeMillis();
+        if (sn > 0) {
+            serverOffset = sn - System.currentTimeMillis();
+            lastViewServerNow = sn;
+        }
         JSONObject me = playerBySeat(v, sSeat);
         if (me != null) {
             String c = jStr(me, "color", "");
