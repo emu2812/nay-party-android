@@ -227,6 +227,16 @@ public class MainActivity extends Activity {
     private long aimLastSentAt = 0;
     private boolean aimFlushScheduled = false;
 
+    // tien-len local selection: card ids tapped up from the CURRENT
+    // hand. Keyed by the exact hand contents (tlHandSig) — a new hand
+    // (successful play, new match) clears it; an unrelated rebuild and
+    // a rejected play (error toast only, hand unchanged) never do.
+    private final HashSet<Integer> tlSel = new HashSet<Integer>();
+    private String tlHandSig = "";
+    private Button tlPlayBtn;           // tien-len ĐÁNH BÀI (enabled state patched by card toggles)
+    private TextView tlSelLine;         // tien-len selection counter line (patched by card toggles)
+    private long tlLockUntil = 0;       // tien-len play/pass double-tap lockout (ngua pattern)
+
     // ======================= lifecycle =======================
 
     @Override
@@ -1607,6 +1617,48 @@ public class MainActivity extends Activity {
                 sb.append(':').append(mc == null ? "?" : (jBool(mc, "alive", true) ? "alive" : "dead"));
                 JSONObject bm = jObj(g, "boom");
                 if (bm != null) sb.append(':').append(jLong(bm, "at", 0));
+            } else if (gid.equals("tien-len")) {
+                // Discrete card state, ca-ngua pattern: my exact hand,
+                // the table play, whose turn, counts, passed flags, the
+                // finish order and the win banner all drive rebuilds.
+                // My card SELECTION is local-only and deliberately NOT
+                // here — toggling cards must never rebuild the grid.
+                JSONArray mh = jArr(g, "myHand");
+                sb.append(":h");
+                if (mh != null) for (int i = 0; i < mh.length(); i++) sb.append(',').append(mh.optInt(i, -1));
+                sb.append(':').append(jBool(g, "myTurn", false) ? "mt" : "wt");
+                sb.append(':').append(jBool(g, "myPassed", false) ? "mp" : "np");
+                JSONObject tb = jObj(g, "table");
+                if (tb == null) sb.append(":t-");
+                else {
+                    sb.append(":t").append(jInt(tb, "seat", -1));
+                    JSONArray tc = jArr(tb, "cards");
+                    if (tc != null) for (int i = 0; i < tc.length(); i++) sb.append(',').append(tc.optInt(i, -1));
+                }
+                sb.append(':').append(g.opt("turn"));
+                JSONObject cn = jObj(g, "counts");
+                JSONObject pd = jObj(g, "passed");
+                JSONArray ps4 = jArr(v, "players");
+                if (ps4 != null) {
+                    for (int i = 0; i < ps4.length(); i++) {
+                        JSONObject p4 = ps4.optJSONObject(i);
+                        if (p4 == null) continue;
+                        int st4 = jInt(p4, "seat", -1);
+                        sb.append('|').append(st4).append('=')
+                            .append(cn == null ? -1 : cn.optInt(String.valueOf(st4), -1))
+                            .append(pd != null && pd.optBoolean(String.valueOf(st4), false) ? "P" : "");
+                    }
+                }
+                JSONArray fn = jArr(g, "finished");
+                sb.append(":f");
+                if (fn != null) for (int i = 0; i < fn.length(); i++) sb.append(',').append(fn.optInt(i, -1));
+                sb.append(':').append(g.opt("myRank"));
+                sb.append(':').append(g.opt("winner"));
+                JSONObject iw = jObj(g, "instantWin");
+                if (iw != null) sb.append(":iw").append(jInt(iw, "seat", -1)).append(jStr(iw, "kind", ""));
+                JSONArray lg3 = jArr(g, "log");
+                sb.append(':').append(lg3 == null ? 0 : lg3.length());
+                if (lg3 != null && lg3.length() > 0) sb.append(':').append(lg3.optString(lg3.length() - 1, ""));
             }
             return sb.toString();
         }
@@ -2346,6 +2398,7 @@ public class MainActivity extends Activity {
         if (gid.equals("da-bong")) return new int[] { 0xFF0B3D1E, 0xFF04150A };
         if (gid.equals("ech-op")) return new int[] { 0xFF2E1C07, 0xFF0D0701 };
         if (gid.equals("can-goc")) return new int[] { 0xFF0E2233, 0xFF050C14 };
+        if (gid.equals("tien-len")) return new int[] { 0xFF14532D, 0xFF052E16 };
         return new int[] { C_PANEL, C_BG };
     }
 
@@ -2379,12 +2432,13 @@ public class MainActivity extends Activity {
         tvRowMeta = null; tvRowHits = null; tvRowSplash = null;
         tvScoreLine = null; tvFrogLine = null; tvDynStatus = null;
         tvAimAngle = null; tvAimPower = null; tvAimFace = null;
+        tlPlayBtn = null; tlSelLine = null;
         String gid = jStr(g, "id", "");
         // Leaving the cannon screen kills any held-stepper repeat loop.
         if (!gid.equals("can-goc")) aimGen++;
         String gp = jStr(g, "phase", "");
         int[] sc = stageColors(gid);
-        if (gp.equals("countdown")) {
+        if (gp.equals("countdown") && !gid.equals("tien-len")) {
             LinearLayout c = col();
             c.setGravity(Gravity.CENTER);
             c.addView(centerText(jStr(g, "name", ""), 27, C_TEXT, true));
@@ -2419,6 +2473,7 @@ public class MainActivity extends Activity {
         else if (gid.equals("da-bong")) inner = soccerPad(v, g);
         else if (gid.equals("ech-op")) inner = frogPad(v, g);
         else if (gid.equals("can-goc")) inner = cannonAim(v, g);
+        else if (gid.equals("tien-len")) inner = tienLen(v, g);
         else {
             inner = col();
             inner.addView(centerText("Đang chơi: " + jStr(g, "name", ""), 18, C_TEXT, true));
@@ -4892,6 +4947,356 @@ public class MainActivity extends Activity {
                 ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f);
             svp.topMargin = dp(10);
             c.addView(sv, svp);
+        }
+        c.addView(timerLine("sec"), matchWrap(2));
+        return c;
+    }
+
+    // ---------- Tiến Lên Miền Nam (versus: shedding card game) ----------
+    // Card encoding (server contract): rank index = id % 13 ->
+    // 3,4,5,6,7,8,9,10,J,Q,K,A,2; suit = id / 13 -> 0 ♠, 1 ♣, 2 ♦, 3 ♥;
+    // ♦ and ♥ are red. This phone only ever receives its OWN hand
+    // (myHand) — everyone else is public counts. Selection is local
+    // state keyed by the exact hand (see tlSel above), mirroring the
+    // web phone: a rejected play arrives as an error toast, the hand
+    // is unchanged, so the selection survives untouched.
+    private static final String[] TL_RANKS = { "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K", "A", "2" };
+    private static final String[] TL_SUITS = { "♠", "♣", "♦", "♥" };
+
+    private String tlCardLabel(int id) {
+        if (id < 0 || id > 51) return "?";
+        return TL_RANKS[id % 13] + TL_SUITS[id / 13];
+    }
+
+    private boolean tlCardRed(int id) {
+        int s = id / 13;
+        return s == 2 || s == 3;
+    }
+
+    private String tlKindLabel(String kind, int len) {
+        if (kind.equals("single")) return "1 lá";
+        if (kind.equals("pair")) return "Đôi";
+        if (kind.equals("triple")) return "Ba lá";
+        if (kind.equals("quad")) return "Tứ quý 💣";
+        if (kind.equals("seq")) return "Sảnh " + len + " lá";
+        if (kind.equals("dseq")) return "Đôi thông " + (len / 2) + " đôi 💣";
+        return kind + (len > 0 ? " (" + len + " lá)" : "");
+    }
+
+    private String tlInstantLabel(String kind) {
+        if (kind.equals("dragon")) return "Sảnh rồng";
+        if (kind.equals("sixpairs")) return "Sáu đôi";
+        if (kind.equals("quad3")) return "Tứ quý 3";
+        if (kind.equals("dseq4")) return "Bốn đôi thông";
+        return kind;
+    }
+
+    private boolean tlTryLock() {
+        long now = System.currentTimeMillis();
+        if (now < tlLockUntil) return false;
+        tlLockUntil = now + 1200;
+        return true;
+    }
+
+    private void tlPaintCard(Button b, int id, boolean selected) {
+        boolean red = tlCardRed(id);
+        if (selected) {
+            b.setBackground(roundRect(Color.parseColor("#FFC93D"), Color.WHITE, 12));
+            b.setTextColor(Color.parseColor("#3A2703"));
+            b.setTranslationY(-dp(5));
+        } else {
+            b.setBackground(roundRect(Color.parseColor("#F7F3FF"), red ? C_RED : C_MUTED, 12));
+            b.setTextColor(red ? Color.parseColor("#D42B2B") : Color.parseColor("#241B3A"));
+            b.setTranslationY(0);
+        }
+    }
+
+    /** Patch the action row in place after a card toggle (no rebuild). */
+    private void tlRefreshActionRow(JSONObject g) {
+        if (tlSelLine != null) {
+            tlSelLine.setText(tlSel.isEmpty() ? "Chạm vào lá bài để chọn"
+                : "Đã chọn: " + tlSel.size() + " lá");
+        }
+        if (tlPlayBtn != null) {
+            boolean can = g != null && jBool(g, "myTurn", false) && !tlSel.isEmpty()
+                && !(g.opt("myRank") instanceof Number);
+            tlPlayBtn.setEnabled(can);
+            tlPlayBtn.setAlpha(can ? 1f : 0.45f);
+        }
+    }
+
+    /** One card-face toggle button for the hand grid. Fires on touch
+     *  down; the toggle repaints THIS button only, so the grid never
+     *  rebuilds under the finger. Toggling is allowed off-turn too
+     *  (pre-planning); ĐÁNH BÀI stays gated by tlRefreshActionRow. */
+    private Button tlCardButton(final int id, boolean selected, boolean tappable) {
+        final Button b = new Button(this);
+        b.setText(tlCardLabel(id));
+        b.setTextSize(TypedValue.COMPLEX_UNIT_SP, 18);
+        b.setTypeface(Typeface.DEFAULT_BOLD);
+        b.setAllCaps(false);
+        b.setMinHeight(dp(56));
+        b.setMinimumHeight(dp(56));
+        b.setPadding(dp(2), dp(6), dp(2), dp(6));
+        tlPaintCard(b, id, selected);
+        if (!tappable) {
+            b.setEnabled(false);
+            b.setAlpha(0.8f);
+            return b;
+        }
+        fireOnDown(b, new Runnable() {
+            @Override public void run() {
+                JSONObject gNow = view == null ? null : jObj(view, "game");
+                if (gNow == null || !jStr(gNow, "id", "").equals("tien-len")
+                    || !jStr(gNow, "phase", "").equals("cards")
+                    || gNow.opt("myRank") instanceof Number) return;
+                boolean nowSel;
+                if (tlSel.contains(id)) { tlSel.remove(id); nowSel = false; }
+                else { tlSel.add(id); nowSel = true; }
+                tapBuzz();
+                tlPaintCard(b, id, nowSel);
+                tlRefreshActionRow(gNow);
+            }
+        });
+        return b;
+    }
+
+    /** Small face-up card chip for the table display (not a button). */
+    private TextView tlChip(int id) {
+        TextView t = centerText(tlCardLabel(id), 14,
+            tlCardRed(id) ? Color.parseColor("#D42B2B") : Color.parseColor("#241B3A"), true);
+        t.setBackground(roundRect(Color.parseColor("#F7F3FF"), C_MUTED, 8));
+        t.setPadding(dp(6), dp(3), dp(6), dp(3));
+        return t;
+    }
+
+    private LinearLayout tienLen(JSONObject v, JSONObject g) {
+        LinearLayout c = col();
+        c.setGravity(Gravity.CENTER_HORIZONTAL);
+        String gp = jStr(g, "phase", "");
+        JSONArray hand = jArr(g, "myHand");
+        // The selection belongs to THIS exact hand; any other clears it.
+        StringBuilder hs = new StringBuilder();
+        if (hand != null) for (int i = 0; i < hand.length(); i++) hs.append(hand.optInt(i, -1)).append(',');
+        if (!hs.toString().equals(tlHandSig)) { tlSel.clear(); tlHandSig = hs.toString(); }
+
+        if (gp.equals("tlWin")) {
+            int winner = jInt(g, "winner", -1);
+            c.addView(centerText(winner == sSeat ? "🎉 BẠN THẮNG!"
+                : "🏆 " + playerName(v, winner) + " THẮNG!", 28,
+                winner == sSeat ? C_GREEN : C_TEXT, true), matchWrap(16));
+            JSONObject iw = jObj(g, "instantWin");
+            if (iw != null) {
+                c.addView(centerText("⚡ TỚI TRẮNG: " + tlInstantLabel(jStr(iw, "kind", ""))
+                    + " — " + playerName(v, jInt(iw, "seat", -1)), 18,
+                    Color.parseColor("#FFC93D"), true), matchWrap(4));
+            }
+            Object rk0 = g.opt("myRank");
+            if (rk0 instanceof Number) {
+                c.addView(centerText("Bạn về thứ " + ((Number) rk0).intValue(), 17, C_MUTED, true), matchWrap(4));
+            }
+            c.addView(timerLine("sec"), matchWrap(6));
+            return c;
+        }
+
+        boolean countdown = gp.equals("countdown");
+        boolean myTurn = jBool(g, "myTurn", false);
+        boolean myPassed = jBool(g, "myPassed", false);
+        Object myRank = g.opt("myRank");
+        boolean finished = myRank instanceof Number;
+        JSONObject table = jObj(g, "table");
+        int turn = jInt(g, "turn", -1);
+        int leader = jInt(g, "leader", -1);
+
+        // --- status banner ---
+        if (finished) {
+            c.addView(centerText("🏁 Bạn về thứ " + ((Number) myRank).intValue()
+                + " — xem nốt ván nhé!", 21, Color.parseColor("#FFC93D"), true), matchWrap(4));
+        } else if (countdown) {
+            c.addView(centerText("🃏 TIẾN LÊN — Chuẩn bị…", 21, C_TEXT, true), matchWrap(4));
+        } else if (myTurn) {
+            c.addView(centerText(table == null ? "🎯 TỚI LƯỢT BẠN — CẦM CÁI!" : "🎯 TỚI LƯỢT BẠN!",
+                22, Color.parseColor("#FFC93D"), true), matchWrap(4));
+        } else {
+            c.addView(centerText("Lượt của " + playerName(v, turn), 20, C_TEXT, true), matchWrap(4));
+        }
+        if (!countdown && !finished && myTurn && jBool(g, "mustInclude3", false)) {
+            c.addView(centerText("⚠️ Lượt đầu tiên: bộ đánh ra phải có lá 3♠", 14,
+                Color.parseColor("#FFC93D"), true), matchWrap(2));
+        }
+        if (!countdown && !finished && myPassed) {
+            c.addView(centerText("✋ Bạn đã bỏ lượt vòng này", 14, C_MUTED, false), matchWrap(2));
+        }
+
+        // --- the table: the play to beat, face up ---
+        if (table == null) {
+            c.addView(centerText(countdown ? "Đang chia bài…"
+                : (leader == sSeat ? "Bàn trống — bạn cầm cái, đánh bất kỳ bộ nào."
+                    : "Bàn trống — " + playerName(v, leader) + " cầm cái."),
+                15, C_MUTED, false), matchWrap(6));
+        } else {
+            c.addView(centerText(playerName(v, jInt(table, "seat", -1)) + " đã đánh: "
+                + tlKindLabel(jStr(table, "kind", ""), jInt(table, "len", 0)),
+                16, C_TEXT, true), matchWrap(6));
+            JSONArray tc = jArr(table, "cards");
+            if (tc != null && tc.length() > 0) {
+                LinearLayout trow = new LinearLayout(this);
+                trow.setOrientation(LinearLayout.HORIZONTAL);
+                trow.setGravity(Gravity.CENTER);
+                for (int i = 0; i < tc.length(); i++) {
+                    LinearLayout.LayoutParams cp = new LinearLayout.LayoutParams(
+                        ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+                    if (i > 0) cp.leftMargin = dp(4);
+                    trow.addView(tlChip(tc.optInt(i, -1)), cp);
+                }
+                c.addView(trow, matchWrap(2));
+            }
+        }
+
+        // --- other players: remaining counts as compact chips ---
+        JSONArray ps = jArr(v, "players");
+        JSONObject counts = jObj(g, "counts");
+        JSONObject passed = jObj(g, "passed");
+        JSONArray fin = jArr(g, "finished");
+        if (ps != null) {
+            LinearLayout chipRow = null;
+            int n = 0;
+            for (int i = 0; i < ps.length(); i++) {
+                JSONObject p = ps.optJSONObject(i);
+                if (p == null) continue;
+                int seat = jInt(p, "seat", -1);
+                if (seat < 0 || seat == sSeat) continue;
+                if (n % 2 == 0) {
+                    chipRow = new LinearLayout(this);
+                    chipRow.setOrientation(LinearLayout.HORIZONTAL);
+                    c.addView(chipRow, matchWrap(6));
+                }
+                int cnt = counts == null ? -1 : counts.optInt(String.valueOf(seat), -1);
+                String label = jStr(p, "name", "") + ": " + (cnt < 0 ? "?" : cnt + " lá");
+                int rank = -1;
+                if (fin != null) {
+                    for (int k = 0; k < fin.length(); k++) if (fin.optInt(k, -1) == seat) rank = k + 1;
+                }
+                if (rank > 0) label += " · 🏁 thứ " + rank;
+                else if (passed != null && passed.optBoolean(String.valueOf(seat), false)) label += " · ✋ bỏ";
+                boolean isTurn = seat == turn && !countdown;
+                Integer pc = SEAT_HEX.get(jStr(p, "color", "blue"));
+                TextView chip = centerText(label, 13,
+                    isTurn ? Color.parseColor("#FFC93D") : C_TEXT, true);
+                chip.setBackground(roundRect(C_PANEL2,
+                    isTurn ? Color.parseColor("#FFC93D") : (pc != null ? pc : C_MUTED), 10));
+                chip.setPadding(dp(8), dp(4), dp(8), dp(4));
+                LinearLayout.LayoutParams cp = new LinearLayout.LayoutParams(
+                    0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
+                if (n % 2 == 1) cp.leftMargin = dp(6);
+                chipRow.addView(chip, cp);
+                n++;
+            }
+            if (chipRow != null && n % 2 == 1) {
+                chipRow.addView(new View(this), new LinearLayout.LayoutParams(0, 1, 1f));
+            }
+        }
+
+        // --- recent table talk ---
+        JSONArray log = jArr(g, "log");
+        if (log != null && log.length() > 0) {
+            for (int i = log.length() - 1; i >= Math.max(0, log.length() - 2); i--) {
+                c.addView(centerText(log.optString(i, ""), 13,
+                    i == log.length() - 1 ? C_HINT : C_MUTED, false), matchWrap(2));
+            }
+        }
+
+        // --- my hand: scrollable grid, action row stays pinned ---
+        int handN = hand == null ? 0 : hand.length();
+        c.addView(centerText("Bài của bạn (" + handN + " lá):", 15, C_MUTED, true), matchWrap(8));
+        LinearLayout handCol = col();
+        if (hand != null) {
+            LinearLayout hrow = null;
+            for (int i = 0; i < hand.length(); i++) {
+                if (i % 4 == 0) {
+                    hrow = new LinearLayout(this);
+                    hrow.setOrientation(LinearLayout.HORIZONTAL);
+                    handCol.addView(hrow, matchWrap(i == 0 ? 0 : 6));
+                }
+                int id = hand.optInt(i, -1);
+                Button b = tlCardButton(id, tlSel.contains(id), !countdown && !finished);
+                LinearLayout.LayoutParams bp = new LinearLayout.LayoutParams(0, dp(56), 1f);
+                if (i % 4 != 0) bp.leftMargin = dp(6);
+                hrow.addView(b, bp);
+            }
+        }
+        ScrollView sv = new ScrollView(this);
+        sv.addView(handCol);
+        LinearLayout.LayoutParams svp = new LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f);
+        svp.topMargin = dp(4);
+        c.addView(sv, svp);
+
+        if (!countdown && !finished) {
+            TextView sel = centerText("", 14, C_HINT, true);
+            tlSelLine = sel;
+            c.addView(sel, matchWrap(6));
+            LinearLayout arow = new LinearLayout(this);
+            arow.setOrientation(LinearLayout.HORIZONTAL);
+            Button play = bigButton("ĐÁNH BÀI", Color.parseColor("#1FA855"), C_GREEN, 20);
+            tlPlayBtn = play;
+            arow.addView(play, new LinearLayout.LayoutParams(0, dp(60), 2f));
+            fireOnDown(play, new Runnable() {
+                @Override public void run() {
+                    JSONObject gNow = view == null ? null : jObj(view, "game");
+                    if (gNow == null || !jStr(gNow, "id", "").equals("tien-len")
+                        || !jBool(gNow, "myTurn", false) || tlSel.isEmpty()) return;
+                    if (!tlTryLock()) return;
+                    // Send in hand order (already rank/suit sorted).
+                    JSONArray cards = new JSONArray();
+                    JSONArray hNow = jArr(gNow, "myHand");
+                    if (hNow != null) {
+                        for (int i = 0; i < hNow.length(); i++) {
+                            int id = hNow.optInt(i, -1);
+                            if (tlSel.contains(id)) cards.put(id);
+                        }
+                    }
+                    if (cards.length() == 0) return;
+                    JSONObject bdy = actionBody("play");
+                    try { bdy.put("cards", cards); } catch (Exception ignored) { }
+                    vibrate(25);
+                    sendAction(bdy, true);
+                }
+            });
+            if (myTurn && table != null && !myPassed) {
+                Button pass = bigButton("BỎ LƯỢT", Color.parseColor("#7A2233"), C_RED, 17);
+                LinearLayout.LayoutParams qp = new LinearLayout.LayoutParams(0, dp(60), 1.2f);
+                qp.leftMargin = dp(8);
+                arow.addView(pass, qp);
+                fireOnDown(pass, new Runnable() {
+                    @Override public void run() {
+                        JSONObject gNow = view == null ? null : jObj(view, "game");
+                        if (gNow == null || !jStr(gNow, "id", "").equals("tien-len")
+                            || !jBool(gNow, "myTurn", false)) return;
+                        if (!tlTryLock()) return;
+                        vibrate(25);
+                        sendAction(actionBody("pass"), true);
+                    }
+                });
+            }
+            Button clear = bigButton("BỎ CHỌN", C_PANEL2, C_MUTED, 16);
+            LinearLayout.LayoutParams kp = new LinearLayout.LayoutParams(0, dp(60), 1f);
+            kp.leftMargin = dp(8);
+            arow.addView(clear, kp);
+            fireOnDown(clear, new Runnable() {
+                @Override public void run() {
+                    if (tlSel.isEmpty()) return;
+                    tlSel.clear();
+                    tapBuzz();
+                    tlRefreshActionRow(view == null ? null : jObj(view, "game"));
+                    // Repaint the grid with nothing selected (rebuild is
+                    // deferred by the touch guard until the finger lifts).
+                    currentSig = "";
+                    if (view != null) applyView(view);
+                }
+            });
+            c.addView(arow, matchWrap(6));
+            tlRefreshActionRow(g);
         }
         c.addView(timerLine("sec"), matchWrap(2));
         return c;

@@ -46,6 +46,11 @@ không qua webview, chạm là ăn ngay ở tầng hệ điều hành.
    - **Giải Mã Chung** (hợp tác) — danh sách các bước mật mã *chỉ của
      mình* (bước đã xong có ✓, bước tới lượt mình có 👉), 4 nút ký hiệu
      ĐỎ / XANH / VÀNG / HỒNG, header hiện màn + tim đội + tiến độ.
+   - **Tiến Lên Miền Nam** — bài trên tay hiện dạng lưới lá bài (♦♥ đỏ),
+     chạm để chọn/bỏ chọn (lá được chọn nhấc lên + viền vàng), nút ĐÁNH
+     BÀI / BỎ LƯỢT / BỎ CHỌN; hiện bộ trên bàn cần chặn, số lá còn lại
+     của từng đối thủ và thứ hạng khi về đích. Đánh sai bị máy chủ từ
+     chối thì bài đã chọn vẫn giữ nguyên.
    - Game hợp tác: màn kết quả và bục vinh quang hiện **banner thành tích
      đội** (hạng + điểm mỗi người + thành tích đội) giống bản web.
 4. App rung khi trả lời đúng, thắng vòng, mất mạng/bị loại (giống bản web),
