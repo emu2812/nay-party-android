@@ -167,6 +167,18 @@ public class MainActivity extends Activity {
     private String currentSig = "";     // structure signature of what's on screen
     private FrameLayout rootFrame;
 
+    // ---- touch guard (v1.9) ----
+    // A state push that lands while a finger is on a game control must
+    // not rebuild the screen mid-touch: the rebuild detaches the very
+    // view being held (pad cluster, stepper, picker), which reads as
+    // dropped presses and lost holds — the "not smooth" complaint.
+    // dispatchTouchEvent counts live touches window-wide; applyView
+    // defers the structural rebuild while the count is > 0 (dynamic
+    // text still patches in place) and the release flush applies the
+    // newest stored view the moment the last finger lifts.
+    private int touchDepth = 0;
+    private boolean rebuildDeferred = false;
+
     // dynamic (updated in place between rebuilds)
     private TextView tvTimer;           // countdown / phase timer text
     private TextView tvMyCount;         // dua-bam my tap count
@@ -180,6 +192,7 @@ public class MainActivity extends Activity {
     private TextView tvFrogLine;        // ech-op hearts/chamber/flies (updated in place)
     private TextView tvAimAngle, tvAimPower, tvAimFace; // can-goc aim readouts (updated in place)
     private TextView tvCrownLine;       // giu-vuong-mien holder banner (updated in place, no rebuild)
+    private TextView tvDynStatus;       // ma-soi in-place status line: wolf votes-in (night) / vote counter (day)
     // cheo-thuyen fast-ticker refs (beat flash runs off server-synced time)
     private Button rowBtn;
     private GradientDrawable rowBgNorm, rowBgGold;
@@ -255,6 +268,10 @@ public class MainActivity extends Activity {
     @Override
     protected void onPause() {
         super.onPause();
+        // Any live gesture is dead once backgrounded; a rebuild deferred
+        // by it is picked up by the next applyView after resume (its
+        // signature still differs from what's on screen).
+        touchDepth = 0;
         // Never leave a pad bit stuck "held" on the server.
         clearPad(true);
         // Stop polling while backgrounded; onResume restarts it.
@@ -302,6 +319,11 @@ public class MainActivity extends Activity {
         // columns that reflow on their own — rebuilding them would lose
         // half-typed join input.
         if (!destroyed && inRoom && view != null) {
+            // Rotation cancels the gesture stream (the held views are
+            // about to be replaced wholesale), so the touch guard must
+            // not defer this forced rebuild.
+            touchDepth = 0;
+            rebuildDeferred = false;
             currentSig = "";
             applyView(view);
         }
@@ -311,6 +333,51 @@ public class MainActivity extends Activity {
     public void onBackPressed() {
         if (inRoom) { leaveRoom(null); return; }
         super.onBackPressed();
+    }
+
+    /**
+     * Touch bookkeeping for the rebuild guard: every finger currently
+     * down anywhere in the window (pad, disc, stepper, picker, scroll
+     * drag, chat field) raises touchDepth. When the LAST finger lifts
+     * and a rebuild was deferred meanwhile, flush it — posted, so the
+     * release event finishes reaching the touched view first (its own
+     * UP handling, e.g. DiscPad clearing its bits, runs on the view
+     * that was actually touched).
+     */
+    @Override
+    public boolean dispatchTouchEvent(MotionEvent ev) {
+        int a = ev.getActionMasked();
+        if (a == MotionEvent.ACTION_DOWN || a == MotionEvent.ACTION_POINTER_DOWN) {
+            touchDepth++;
+        } else if (a == MotionEvent.ACTION_UP || a == MotionEvent.ACTION_POINTER_UP) {
+            if (touchDepth > 0) touchDepth--;
+            if (touchDepth == 0 && rebuildDeferred) {
+                ui.post(new Runnable() {
+                    @Override public void run() { flushDeferredRebuild(); }
+                });
+            }
+        } else if (a == MotionEvent.ACTION_CANCEL) {
+            touchDepth = 0;
+            if (rebuildDeferred) {
+                ui.post(new Runnable() {
+                    @Override public void run() { flushDeferredRebuild(); }
+                });
+            }
+        }
+        return super.dispatchTouchEvent(ev);
+    }
+
+    /** Apply a structural rebuild that was held back by an active touch. */
+    private void flushDeferredRebuild() {
+        rebuildDeferred = false;
+        if (destroyed || !inRoom || view == null) return;
+        String sig = signature(view);
+        if (!sig.equals(currentSig)) {
+            currentSig = sig;
+            setScreen(buildRoom(view));
+        } else {
+            updateDynamic(view);
+        }
     }
 
     // ======================= small UI helpers =======================
@@ -358,6 +425,11 @@ public class MainActivity extends Activity {
         b.setAllCaps(false);
         b.setBackground(roundRect(fill, stroke, 22));
         b.setPadding(dp(14), dp(12), dp(14), dp(12));
+        // v1.9 fit rule: no game-action button is ever shorter than a
+        // comfortable thumb target, even where a screen wraps content
+        // instead of giving the button an explicit height.
+        b.setMinHeight(dp(56));
+        b.setMinimumHeight(dp(56));
         return b;
     }
 
@@ -390,6 +462,11 @@ public class MainActivity extends Activity {
             if (v != null) v.vibrate(ms);
         } catch (Exception ignored) { }
     }
+
+    /** One short confirmation pulse for a single deliberate game action
+     *  (vote, answer, guess, symbol, swallow/spit…). Never used on
+     *  holds or repeats — those get their feedback from the screen. */
+    private void tapBuzz() { vibrate(12); }
 
     private void vibratePattern(long[] pattern) {
         try {
@@ -1256,6 +1333,17 @@ public class MainActivity extends Activity {
         checkVibrations(v);
         String sig = signature(v);
         if (!sig.equals(currentSig)) {
+            if (touchDepth > 0) {
+                // A finger is on a control right now: rebuilding would
+                // detach the held view and kill the press/hold. Keep the
+                // newest view (already stored above), patch the dynamic
+                // texts in place, and let the release flush in
+                // dispatchTouchEvent do the structural rebuild.
+                rebuildDeferred = true;
+                updateDynamic(v);
+                return;
+            }
+            rebuildDeferred = false;
             currentSig = sig;
             setScreen(buildRoom(v));
         } else {
@@ -1424,7 +1512,10 @@ public class MainActivity extends Activity {
                 sb.append(':').append(jBool(g, "myAlive", true) ? "alive" : "dead");
                 if (gp.equals("night")) {
                     sb.append(':').append(g.opt("myWolfVote"));
-                    sb.append(':').append(jInt(g, "wolfVotesIn", 0));
+                    // wolfVotesIn is NOT structural: other wolves voting
+                    // only moves a counter line, which updateDynamic
+                    // patches in place via tvDynStatus (my own pick stays
+                    // structural via myWolfVote above).
                     sb.append(':').append(g.opt("myGuardPick"));
                     sb.append(':').append(g.opt("mySeerPick"));
                     JSONArray notes = jArr(g, "mySeerNotes");
@@ -1457,14 +1548,14 @@ public class MainActivity extends Activity {
                         }
                     }
                 } else if (gp.equals("vote")) {
+                    // Only MY voted bit is structural (it swaps the
+                    // picker for the waiting card); everyone else's votes
+                    // only move the counter line, patched in place via
+                    // tvDynStatus — a 12-player vote no longer rebuilds
+                    // the screen under the next player's finger.
                     JSONObject voted = jObj(g, "voted");
-                    JSONArray ps2 = jArr(v, "players");
-                    if (voted != null && ps2 != null) {
-                        for (int i = 0; i < ps2.length(); i++) {
-                            JSONObject p2 = ps2.optJSONObject(i);
-                            if (p2 != null) sb.append('|').append(voted.optBoolean(String.valueOf(jInt(p2, "seat", 0)), false) ? 1 : 0);
-                        }
-                    }
+                    sb.append(':').append(voted != null
+                        && voted.optBoolean(String.valueOf(sSeat), false) ? "voted" : "open");
                 } else if (gp.equals("execute") || gp.equals("wolfEnd")) {
                     JSONObject ex = jObj(g, "exec");
                     sb.append(':').append(ex == null ? "" : String.valueOf(ex.opt("seat")));
@@ -1611,6 +1702,32 @@ public class MainActivity extends Activity {
                 int f = jInt(mc, "face", 0);
                 if (f != 0) aimFace = f;
                 refreshAimReadouts();
+            }
+        }
+        if (gid.equals("ma-soi") && tvDynStatus != null) {
+            // Picker status lines (night: how many wolf votes are in;
+            // day: the public vote counter) patch in place — other
+            // players acting never rebuilds this screen any more.
+            String gp2 = jStr(g, "phase", "");
+            if (gp2.equals("night") && jStr(g, "myRole", "").equals("soi")) {
+                JSONArray team = jArr(g, "wolfTeam");
+                tvDynStatus.setText("Phiếu sói đã vào: " + jInt(g, "wolfVotesIn", 0)
+                    + "/" + (team == null ? 0 : team.length()));
+            } else if (gp2.equals("vote")) {
+                JSONObject voted = jObj(g, "voted");
+                JSONArray ps = jArr(v, "players");
+                int inCount = 0, aliveCount = 0;
+                if (ps != null) {
+                    for (int i = 0; i < ps.length(); i++) {
+                        JSONObject p = ps.optJSONObject(i);
+                        if (p == null) continue;
+                        int ts = jInt(p, "seat", -1);
+                        if (!wolfAlive(g, ts)) continue;
+                        aliveCount++;
+                        if (voted != null && voted.optBoolean(String.valueOf(ts), false)) inCount++;
+                    }
+                }
+                tvDynStatus.setText("Đã vào phiếu: " + inCount + "/" + aliveCount + " người còn sống");
             }
         }
     }
@@ -2260,7 +2377,7 @@ public class MainActivity extends Activity {
         // refs so the ticker idles until rowBoat() installs fresh ones.
         rowBtn = null; rowTrack = null; rowFill = null;
         tvRowMeta = null; tvRowHits = null; tvRowSplash = null;
-        tvScoreLine = null; tvFrogLine = null;
+        tvScoreLine = null; tvFrogLine = null; tvDynStatus = null;
         tvAimAngle = null; tvAimPower = null; tvAimFace = null;
         String gid = jStr(g, "id", "");
         // Leaving the cannon screen kills any held-stepper repeat loop.
@@ -2329,6 +2446,7 @@ public class MainActivity extends Activity {
                     @Override public void run() {
                         if (lockKey.equals(lock)) return;
                         lockKey = lock;
+                        tapBuzz();
                         sendAction(actionBody("tap"), true);
                     }
                 });
@@ -2345,6 +2463,7 @@ public class MainActivity extends Activity {
                     @Override public void run() {
                         if (lockKey.equals(lock)) return;
                         lockKey = lock;
+                        tapBuzz();
                         sendAction(actionBody("tap"), true);
                     }
                 });
@@ -2504,6 +2623,7 @@ public class MainActivity extends Activity {
                         lockKey = "doan-so:" + round;
                         JSONObject bdy = actionBody("guess");
                         try { bdy.put("value", val); } catch (Exception ignored) { }
+                        tapBuzz();
                         sendAction(bdy, true);
                     }
                 });
@@ -2708,6 +2828,18 @@ public class MainActivity extends Activity {
             if (padState[bit] != held) {
                 padState[bit] = held;
                 onPadChanged();
+                // Ếch Ộp exception: there B/X are discrete one-shot
+                // actions (swallow / spit fire on the rising edge), not
+                // held state — they earn the deliberate-action pulse.
+                // Scoped to that game + phase so every other game's
+                // held bits stay silent, as designed.
+                if (held && (bit == B_B || bit == B_X) && view != null) {
+                    JSONObject gNow = jObj(view, "game");
+                    if (gNow != null && jStr(gNow, "id", "").equals("ech-op")
+                            && jStr(gNow, "phase", "").equals("frog")) {
+                        tapBuzz();
+                    }
+                }
             }
         }
     }
@@ -3471,6 +3603,7 @@ public class MainActivity extends Activity {
                     @Override public void run() {
                         if (lockKey.equals(lock)) return;
                         lockKey = lock;
+                        tapBuzz();
                         sendAction(actionBody("tap"), true);
                     }
                 });
@@ -3487,6 +3620,7 @@ public class MainActivity extends Activity {
                     @Override public void run() {
                         if (lockKey.equals(lock)) return;
                         lockKey = lock;
+                        tapBuzz();
                         sendAction(actionBody("tap"), true);
                     }
                 });
@@ -3812,14 +3946,14 @@ public class MainActivity extends Activity {
                     @Override public void onTextChanged(CharSequence s, int a, int b, int n) { chatDraft = s.toString(); }
                     @Override public void afterTextChanged(android.text.Editable s) { }
                 });
-                rowL.addView(chatIn, new LinearLayout.LayoutParams(0, dp(52), 1f));
+                rowL.addView(chatIn, new LinearLayout.LayoutParams(0, dp(56), 1f));
                 Button send = bigButton("Gửi", Color.parseColor("#2F7FBF"), Color.parseColor("#6DB6F2"), 17);
                 LinearLayout.LayoutParams sbp = new LinearLayout.LayoutParams(
-                    ViewGroup.LayoutParams.WRAP_CONTENT, dp(52));
+                    ViewGroup.LayoutParams.WRAP_CONTENT, dp(56));
                 sbp.leftMargin = dp(8);
                 rowL.addView(send, sbp);
-                send.setOnClickListener(new View.OnClickListener() {
-                    @Override public void onClick(View vw) {
+                fireOnDown(send, new Runnable() {
+                    @Override public void run() {
                         String txt = chatIn.getText().toString().trim();
                         if (txt.length() == 0) { toast("Nhập lời nhắn trước đã."); return; }
                         chatDraft = "";
@@ -3858,6 +3992,7 @@ public class MainActivity extends Activity {
                         lockKey = "chia-cuop:" + round;
                         JSONObject bdy = actionBody("choose");
                         try { bdy.put("choice", "chia"); } catch (Exception ignored) { }
+                        tapBuzz();
                         sendAction(bdy, true);
                     }
                 });
@@ -3870,6 +4005,7 @@ public class MainActivity extends Activity {
                         lockKey = "chia-cuop:" + round;
                         JSONObject bdy = actionBody("choose");
                         try { bdy.put("choice", "cuop"); } catch (Exception ignored) { }
+                        tapBuzz();
                         sendAction(bdy, true);
                     }
                 });
@@ -3997,14 +4133,14 @@ public class MainActivity extends Activity {
                 @Override public void onTextChanged(CharSequence s, int a, int b, int n) { impChatDraft = s.toString(); }
                 @Override public void afterTextChanged(android.text.Editable s) { }
             });
-            rowL.addView(chatIn, new LinearLayout.LayoutParams(0, dp(52), 1f));
+            rowL.addView(chatIn, new LinearLayout.LayoutParams(0, dp(56), 1f));
             Button send = bigButton("Gửi", Color.parseColor("#2F7FBF"), Color.parseColor("#6DB6F2"), 17);
             LinearLayout.LayoutParams sbp = new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.WRAP_CONTENT, dp(52));
+                ViewGroup.LayoutParams.WRAP_CONTENT, dp(56));
             sbp.leftMargin = dp(8);
             rowL.addView(send, sbp);
-            send.setOnClickListener(new View.OnClickListener() {
-                @Override public void onClick(View vw) {
+            fireOnDown(send, new Runnable() {
+                @Override public void run() {
                     String txt = chatIn.getText().toString().trim();
                     if (txt.length() == 0) { toast("Nhập lời nhắn trước đã."); return; }
                     impChatDraft = "";
@@ -4151,6 +4287,7 @@ public class MainActivity extends Activity {
                         if (!gp.equals("decode")) return;
                         JSONObject bdy = actionBody("symbol");
                         try { bdy.put("sym", idx); } catch (Exception ignored) { }
+                        tapBuzz();
                         sendAction(bdy, false);
                     }
                 });
@@ -4273,8 +4410,10 @@ public class MainActivity extends Activity {
                 Object myVote = g.opt("myWolfVote");
                 if (myVote instanceof Number) {
                     body.addView(centerText("Đã chọn con mồi: " + playerName(v, ((Number) myVote).intValue()), 19, C_TEXT, true), matchWrap(8));
-                    body.addView(centerText("Phiếu sói đã vào: " + jInt(g, "wolfVotesIn", 0)
-                        + "/" + (team == null ? 0 : team.length()), 15, C_MUTED, false), matchWrap(2));
+                    TextView votesIn = centerText("Phiếu sói đã vào: " + jInt(g, "wolfVotesIn", 0)
+                        + "/" + (team == null ? 0 : team.length()), 15, C_MUTED, false);
+                    tvDynStatus = votesIn; // patched in place as the pack votes
+                    body.addView(votesIn, matchWrap(2));
                 } else {
                     body.addView(centerText("Chọn con mồi đêm nay:", 17, C_MUTED, true), matchWrap(6));
                     final String lock = "ma-soi:wolfVote:" + night;
@@ -4414,11 +4553,12 @@ public class MainActivity extends Activity {
                         if (poison instanceof Number) {
                             body.addView(centerText("☠️ Sẽ đầu độc: " + playerName(v, ((Number) poison).intValue()), 18, C_TEXT, true), matchWrap(8));
                             Button cancel = bigButton("Huỷ thuốc độc", C_PANEL2, C_MUTED, 16);
-                            body.addView(cancel, lp(ViewGroup.LayoutParams.MATCH_PARENT, dp(50), 6));
+                            body.addView(cancel, lp(ViewGroup.LayoutParams.MATCH_PARENT, dp(56), 6));
                             fireOnDown(cancel, new Runnable() {
                                 @Override public void run() {
                                     JSONObject bdy = actionBody("wolfWitch");
                                     try { bdy.put("poison", JSONObject.NULL); } catch (Exception ignored) { }
+                                    tapBuzz();
                                     sendAction(bdy, true);
                                 }
                             });
@@ -4441,7 +4581,7 @@ public class MainActivity extends Activity {
                                         sendAction(bdy, true);
                                     }
                                 });
-                                body.addView(b, lp(ViewGroup.LayoutParams.MATCH_PARENT, dp(52), 8));
+                                body.addView(b, lp(ViewGroup.LayoutParams.MATCH_PARENT, dp(56), 8));
                             }
                         }
                     }
@@ -4514,14 +4654,14 @@ public class MainActivity extends Activity {
                     @Override public void onTextChanged(CharSequence s, int a, int b, int n) { wolfChatDraft = s.toString(); }
                     @Override public void afterTextChanged(android.text.Editable s) { }
                 });
-                rowL.addView(chatIn, new LinearLayout.LayoutParams(0, dp(52), 1f));
+                rowL.addView(chatIn, new LinearLayout.LayoutParams(0, dp(56), 1f));
                 Button send = bigButton("Gửi", Color.parseColor("#2F7FBF"), Color.parseColor("#6DB6F2"), 17);
                 LinearLayout.LayoutParams sbp = new LinearLayout.LayoutParams(
-                    ViewGroup.LayoutParams.WRAP_CONTENT, dp(52));
+                    ViewGroup.LayoutParams.WRAP_CONTENT, dp(56));
                 sbp.leftMargin = dp(8);
                 rowL.addView(send, sbp);
-                send.setOnClickListener(new View.OnClickListener() {
-                    @Override public void onClick(View vw) {
+                fireOnDown(send, new Runnable() {
+                    @Override public void run() {
                         String txt = chatIn.getText().toString().trim();
                         if (txt.length() == 0) { toast("Nhập lời nhắn trước đã."); return; }
                         wolfChatDraft = "";
@@ -4579,7 +4719,9 @@ public class MainActivity extends Activity {
                         }
                     }
                 }
-                body.addView(centerText("Đã vào phiếu: " + inCount + "/" + aliveCount + " người còn sống", 15, C_MUTED, false), matchWrap(8));
+                TextView voteCount = centerText("Đã vào phiếu: " + inCount + "/" + aliveCount + " người còn sống", 15, C_MUTED, false);
+                tvDynStatus = voteCount; // patched in place as votes land
+                body.addView(voteCount, matchWrap(8));
             }
         } else if (gp.equals("execute")) {
             JSONObject ex = jObj(g, "exec");
@@ -5094,7 +5236,7 @@ public class MainActivity extends Activity {
         }
 
         Button flip = bigButton("⇋ ĐỔI HƯỚNG", Color.parseColor("#2F7FBF"), Color.parseColor("#6DB6F2"), 19);
-        c.addView(flip, lp(ViewGroup.LayoutParams.MATCH_PARENT, dp(54), 10));
+        c.addView(flip, lp(ViewGroup.LayoutParams.MATCH_PARENT, dp(56), 10));
         fireOnDown(flip, new Runnable() {
             @Override public void run() {
                 aimFace = -aimFace;
