@@ -156,6 +156,7 @@ public class MainActivity extends Activity {
     private volatile Socket wsSocket;
     private volatile OutputStream wsOut;
     private volatile int wsGen = 0;
+    private volatile long wsLastMsgAt = 0; // last inbound frame (any opcode): the staleness guard's clock
     private int wsDownGen = -1;         // last generation whose death was handled
     private int wsBackoffIdx = 0;
     private boolean wsWanted = false;   // in a room session (enterRoom/leaveRoom)
@@ -854,7 +855,7 @@ public class MainActivity extends Activity {
     private void sendPadSnapshot(final JSONObject pad) {
         // A pad change is a user action: it ends a "bye" suppression.
         wsKick();
-        if (wsOpen) {
+        if (wsUsable()) {
             // WS path: absolute-state frames over one ordered TCP stream
             // need no coalescing — each snapshot goes out as it happens.
             // Drop anything still queued for HTTP: those snapshots predate
@@ -883,7 +884,8 @@ public class MainActivity extends Activity {
                         // it is stale by construction (the connect sync
                         // and direct WS frames carry newer state) — drop
                         // it instead of letting HTTP overwrite the pad.
-                        if (wsOpen) continue;
+                        // A stale socket does not count: post it instead.
+                        if (wsUsable()) continue;
                         postPadSync(p);
                     }
                 }
@@ -922,7 +924,7 @@ public class MainActivity extends Activity {
         try {
             for (int i = 0; i < PAD_KEYS.length; i++) { on.put(PAD_KEYS[i], i == B_B); off.put(PAD_KEYS[i], false); }
         } catch (Exception ignored) { }
-        if (wsOpen) {
+        if (wsUsable()) {
             // Same press, as two frames: the single ordered wsExec queue
             // (and TCP under it) keeps on-before-off, like the HTTP posts.
             wsSendText(padFrame(on).toString());
@@ -998,6 +1000,34 @@ public class MainActivity extends Activity {
     private void wsKick() {
         if (wsSuppressUntil > 0) wsSuppressUntil = 0;
         wsEnsure();
+    }
+
+    /**
+     * Staleness guard (the SMOOTH5 lesson from the web client): a
+     * half-open socket — Wi-Fi drop, NAT timeout, an idle kill whose
+     * FIN never arrives — leaves wsOpen true forever while the reader
+     * blocks on a read that will never return, and every pad frame
+     * and action vanishes into the dead connection while the HTTP
+     * poll keeps the screen looking alive. Any inbound frame stamps
+     * wsLastMsgAt; silence past the threshold means the channel is
+     * presumed dead even though no error ever fired.
+     */
+    private boolean wsStale() {
+        return wsOpen && wsLastMsgAt > 0
+            && (System.currentTimeMillis() - wsLastMsgAt) > 2500;
+    }
+
+    /** Drop a presumed-dead socket: closing it wakes the blocked
+     *  reader, whose wsOnDown runs the normal backoff reconnect. */
+    private void wsDropStale() {
+        closeQuietly(wsSocket);
+    }
+
+    /** True when the socket may be used for a send right now. */
+    private boolean wsUsable() {
+        if (!wsOpen) return false;
+        if (wsStale()) { wsDropStale(); return false; }
+        return true;
     }
 
     /** Full teardown: invalidate the generation, close the socket. */
@@ -1076,6 +1106,7 @@ public class MainActivity extends Activity {
             sock.setSoTimeout(0);
             wsOut = out;
             wsOpen = true;
+            wsLastMsgAt = System.currentTimeMillis();
             wsConnecting = false;
             wsBackoffIdx = 0;
             final BufferedInputStream fin = in;
@@ -1148,6 +1179,7 @@ public class MainActivity extends Activity {
      */
     private boolean wsSendText(final String text) {
         if (!wsOpen) return false;
+        if (wsStale()) { wsDropStale(); return false; } // never queue into a presumed-dead socket
         final int gen = wsGen;
         try {
             wsExec.execute(new Runnable() {
@@ -1232,6 +1264,7 @@ public class MainActivity extends Activity {
                 byte[] payload = new byte[(int) len];
                 wsReadFully(in, payload, 0, (int) len);
                 if (mask != null) for (int i = 0; i < payload.length; i++) payload[i] ^= mask[i & 3];
+                wsLastMsgAt = System.currentTimeMillis(); // any frame proves the channel lives
 
                 if (op == 0x9) {          // ping -> pong with the same payload
                     try { wsWriteFrame(0xA, payload); } catch (Exception ignored) { }
